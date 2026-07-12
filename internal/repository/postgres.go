@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,9 @@ import (
 	"github.com/aman0603/flowforge/internal/model"
 	_ "github.com/lib/pq" // Postgres driver
 )
+
+// ErrInvalidTaskTransition is returned when a guarded update affects 0 rows.
+var ErrInvalidTaskTransition = errors.New("invalid task state transition or ownership mismatch")
 
 // Repository manages database operations for FlowForge.
 type Repository struct {
@@ -329,6 +333,249 @@ func (r *Repository) GetWorkflowRunDetails(ctx context.Context, runID string) (*
 		Run:   &run,
 		Tasks: tasks,
 	}, nil
+}
+
+// ClaimNextReadyTask atomically claims the oldest READY task and updates it to CLAIMED,
+// returning the combined execution details. Returns (nil, nil) if no READY tasks are found.
+func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start claim transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	const claimQuery = `
+		WITH next_task AS (
+			SELECT id 
+			FROM task_runs 
+			WHERE status = 'READY'
+			ORDER BY created_at ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		),
+		updated_task AS (
+			UPDATE task_runs
+			SET status = 'CLAIMED', worker_id = $1, claimed_at = NOW()
+			FROM next_task
+			WHERE task_runs.id = next_task.id
+			RETURNING 
+				task_runs.id, 
+				task_runs.workflow_run_id, 
+				task_runs.task_definition_id, 
+				task_runs.input
+		)
+		SELECT 
+			ut.id, 
+			ut.workflow_run_id, 
+			ut.task_definition_id, 
+			td.name, 
+			td.task_type, 
+			td.config, 
+			ut.input, 
+			td.timeout_ms
+		FROM updated_task ut
+		JOIN task_definitions td ON ut.task_definition_id = td.id
+	`
+
+	var ct model.ClaimedTask
+	err = tx.QueryRowContext(ctx, claimQuery, workerID).Scan(
+		&ct.TaskRunID,
+		&ct.WorkflowRunID,
+		&ct.TaskDefinitionID,
+		&ct.Name,
+		&ct.TaskType,
+		&ct.Config,
+		&ct.Input,
+		&ct.TimeoutMs,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to claim task run: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit claim transaction: %w", err)
+	}
+
+	return &ct, nil
+}
+
+// StartTaskRun transitions a task from CLAIMED to RUNNING inside a transaction.
+// Guards by ID, status = CLAIMED, and worker_id. It also validates that the parent
+// workflow status is not terminal (is PENDING or RUNNING) in the same query.
+// Transitions workflow status from PENDING to RUNNING if applicable.
+func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerID string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start StartTaskRun transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Transition task CLAIMED -> RUNNING (guarded by task status, worker_id, and workflow status)
+	const updateTaskQuery = `
+		UPDATE task_runs tr
+		SET status = 'RUNNING', started_at = NOW(), attempts = attempts + 1
+		WHERE tr.id = $1
+		  AND tr.status = 'CLAIMED'
+		  AND tr.worker_id = $2
+		  AND EXISTS (
+			  SELECT 1
+			  FROM workflow_runs wr
+			  WHERE wr.id = tr.workflow_run_id
+				AND wr.status IN ('PENDING', 'RUNNING')
+		  )
+	`
+	res, err := tx.ExecContext(ctx, updateTaskQuery, taskRunID, workerID)
+	if err != nil {
+		return fmt.Errorf("failed to update task run to RUNNING: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check task rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrInvalidTaskTransition
+	}
+
+	// 2. Transition workflow PENDING -> RUNNING
+	const updateWorkflowQuery = `
+		UPDATE workflow_runs
+		SET status = 'RUNNING', started_at = NOW()
+		WHERE id = (SELECT workflow_run_id FROM task_runs WHERE id = $1)
+		  AND status = 'PENDING'
+	`
+	_, err = tx.ExecContext(ctx, updateWorkflowQuery, taskRunID)
+	if err != nil {
+		return fmt.Errorf("failed to update workflow run to RUNNING: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit StartTaskRun transaction: %w", err)
+	}
+
+	return nil
+}
+
+// MarkTaskRunCompleted transitions a task from RUNNING to COMPLETED inside a transaction.
+// It also unlocks eligible child task runs and checks if the parent workflow run has finished.
+func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string, workerID string, output json.RawMessage) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start MarkTaskRunCompleted transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if len(output) == 0 {
+		output = json.RawMessage("{}")
+	}
+
+	// 1. Guarded task completion & retrieve run and definition IDs
+	const completeTaskQuery = `
+		UPDATE task_runs
+		SET status = 'COMPLETED', output = $1, error_message = NULL, completed_at = NOW()
+		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3
+		RETURNING workflow_run_id, task_definition_id
+	`
+	var workflowRunID, taskDefID string
+	err = tx.QueryRowContext(ctx, completeTaskQuery, output, taskRunID, workerID).Scan(&workflowRunID, &taskDefID)
+	if err == sql.ErrNoRows {
+		return ErrInvalidTaskTransition
+	} else if err != nil {
+		return fmt.Errorf("failed to update task run status: %w", err)
+	}
+
+	// 2. Unlock eligible direct child tasks (PENDING -> READY)
+	const unlockQuery = `
+		UPDATE task_runs
+		SET status = 'READY'
+		WHERE workflow_run_id = $1
+		  AND status = 'PENDING'
+		  AND task_definition_id IN (
+			  SELECT dep.task_definition_id
+			  FROM task_dependencies dep
+			  WHERE dep.depends_on_task_definition_id = $2
+		  )
+		  AND NOT EXISTS (
+			  SELECT 1
+			  FROM task_dependencies parent_dep
+			  JOIN task_runs parent_tr ON parent_tr.workflow_run_id = $1 
+				   AND parent_tr.task_definition_id = parent_dep.depends_on_task_definition_id
+			  WHERE parent_dep.task_definition_id = task_runs.task_definition_id
+				AND parent_tr.status != 'COMPLETED'
+		  )
+	`
+	_, err = tx.ExecContext(ctx, unlockQuery, workflowRunID, taskDefID)
+	if err != nil {
+		return fmt.Errorf("failed to unlock child tasks: %w", err)
+	}
+
+	// 3. Attempt workflow completion
+	const completeWorkflowQuery = `
+		UPDATE workflow_runs
+		SET status = 'COMPLETED', completed_at = NOW()
+		WHERE id = $1
+		  AND status = 'RUNNING'
+		  AND NOT EXISTS (
+			  SELECT 1
+			  FROM task_runs
+			  WHERE workflow_run_id = $1
+				AND status != 'COMPLETED'
+		  )
+	`
+	_, err = tx.ExecContext(ctx, completeWorkflowQuery, workflowRunID)
+	if err != nil {
+		return fmt.Errorf("failed to complete workflow run: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit MarkTaskRunCompleted transaction: %w", err)
+	}
+
+	return nil
+}
+
+// MarkTaskRunFailed transitions a task from RUNNING to FAILED inside a transaction.
+// Atomically marks the parent workflow run as FAILED if it is in PENDING or RUNNING status.
+func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start MarkTaskRunFailed transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Transition task status and retrieve workflow run ID
+	const failTaskQuery = `
+		UPDATE task_runs
+		SET status = 'FAILED', error_message = $1, completed_at = NOW()
+		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3
+		RETURNING workflow_run_id
+	`
+	var workflowRunID string
+	err = tx.QueryRowContext(ctx, failTaskQuery, errMsg, taskRunID, workerID).Scan(&workflowRunID)
+	if err == sql.ErrNoRows {
+		return ErrInvalidTaskTransition
+	} else if err != nil {
+		return fmt.Errorf("failed to fail task run: %w", err)
+	}
+
+	// 2. Transition workflow status to FAILED only if current status is PENDING or RUNNING
+	const failWorkflowQuery = `
+		UPDATE workflow_runs
+		SET status = 'FAILED', completed_at = NOW(), error_message = $1
+		WHERE id = $2 AND status IN ('PENDING', 'RUNNING')
+	`
+	_, err = tx.ExecContext(ctx, failWorkflowQuery, "Task failed: "+errMsg, workflowRunID)
+	if err != nil {
+		return fmt.Errorf("failed to update workflow status to FAILED: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit MarkTaskRunFailed transaction: %w", err)
+	}
+
+	return nil
 }
 
 // newUUID generates a basic RFC 4122 v4 UUID in pure Go.

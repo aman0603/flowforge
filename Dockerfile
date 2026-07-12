@@ -14,6 +14,7 @@ COPY . .
 
 # Compile the application as a statically linked binary
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/flowforge cmd/flowforge/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/worker cmd/worker/main.go
 
 # --- Run Stage ---
 FROM alpine:3.20
@@ -25,6 +26,7 @@ RUN apk --no-cache add ca-certificates
 
 # Copy compiled binary and the schema file from builder
 COPY --from=builder /app/flowforge .
+COPY --from=builder /app/worker .
 COPY --from=builder /app/schema.sql .
 
 # Expose HTTP port

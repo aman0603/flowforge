@@ -34,5 +34,18 @@ services:
       db:
         condition: service_healthy
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flowforge-worker
+    command: ["./worker"]
+    environment:
+      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      WORKER_POLL_INTERVAL: "1s"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:

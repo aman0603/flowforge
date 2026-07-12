@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     output JSONB NOT NULL DEFAULT '{}'::jsonb,
     error_message TEXT,
     next_retry_at TIMESTAMP WITH TIME ZONE,
+    worker_id VARCHAR(255),
+    claimed_at TIMESTAMP WITH TIME ZONE,
     started_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -76,7 +78,3 @@ CREATE TABLE IF NOT EXISTS task_runs (
 
 CREATE INDEX IF NOT EXISTS idx_task_runs_status_retry ON task_runs(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_run ON task_runs(workflow_run_id);
-
--- Ensure the task_runs constraint is updated to support READY state in existing databases
-ALTER TABLE task_runs DROP CONSTRAINT IF EXISTS chk_task_run_status;
-ALTER TABLE task_runs ADD CONSTRAINT chk_task_run_status CHECK (status IN ('PENDING', 'READY', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'TIMED_OUT'));

@@ -78,6 +78,8 @@ type TaskRun struct {
 	Output           json.RawMessage `json:"output"`
 	ErrorMessage     *string         `json:"error_message,omitempty"`
 	NextRetryAt      *time.Time      `json:"next_retry_at,omitempty"`
+	WorkerID         *string         `json:"worker_id,omitempty"`
+	ClaimedAt        *time.Time      `json:"claimed_at,omitempty"`
 	StartedAt        *time.Time      `json:"started_at,omitempty"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
 	CreatedAt        time.Time       `json:"created_at"`
@@ -111,4 +113,16 @@ type CreateRunRequest struct {
 type WorkflowRunDetails struct {
 	Run   *WorkflowRun `json:"run"`
 	Tasks []*TaskRun   `json:"tasks"`
+}
+
+// ClaimedTask represents an execution-ready task run combined with its definition configurations.
+type ClaimedTask struct {
+	TaskRunID        string          `json:"task_run_id"`
+	WorkflowRunID    string          `json:"workflow_run_id"`
+	TaskDefinitionID string          `json:"task_definition_id"`
+	Name             string          `json:"name"`
+	TaskType         string          `json:"task_type"`
+	Config           json.RawMessage `json:"config"`
+	Input            json.RawMessage `json:"input"`
+	TimeoutMs        int             `json:"timeout_ms"`
 }
