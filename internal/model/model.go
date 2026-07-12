@@ -17,6 +17,7 @@ const (
 // Task states
 const (
 	TaskPending   = "PENDING"
+	TaskReady     = "READY"
 	TaskClaimed   = "CLAIMED"
 	TaskRunning   = "RUNNING"
 	TaskCompleted = "COMPLETED"

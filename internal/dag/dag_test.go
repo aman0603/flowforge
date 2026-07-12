@@ -8,9 +8,10 @@ import (
 
 func TestValidate(t *testing.T) {
 	tests := []struct {
-		name    string
-		req     model.CreateDefinitionRequest
-		wantErr bool
+		name        string
+		req         model.CreateDefinitionRequest
+		wantErr     bool
+		expectedErr string
 	}{
 		{
 			name: "Valid linear graph",
@@ -77,14 +78,15 @@ func TestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "Invalid - direct cycle",
+			name: "Invalid - direct cycle (self-dependency)",
 			req: model.CreateDefinitionRequest{
 				Name: "DirectCycle",
 				Tasks: []model.TaskDefinitionInput{
 					{Name: "TaskA", Dependencies: []string{"TaskA"}},
 				},
 			},
-			wantErr: true,
+			wantErr:     true,
+			expectedErr: `task "TaskA" cannot depend on itself`,
 		},
 		{
 			name: "Invalid - simple indirect cycle",
@@ -116,6 +118,9 @@ func TestValidate(t *testing.T) {
 			err := Validate(&tt.req)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && tt.expectedErr != "" && err.Error() != tt.expectedErr {
+				t.Errorf("Validate() error msg = %q, want %q", err.Error(), tt.expectedErr)
 			}
 		})
 	}

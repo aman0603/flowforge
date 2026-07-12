@@ -174,9 +174,13 @@ func (r *Repository) CreateWorkflowRun(ctx context.Context, definitionID string,
 		return nil, fmt.Errorf("failed to verify workflow definition: %w", err)
 	}
 
-	// 2. Fetch all task definitions associated with this workflow
+	// 2. Fetch all task definitions associated with this workflow and count their parent dependencies
 	const getTasks = `
-		SELECT id, name FROM task_definitions WHERE workflow_definition_id = $1
+		SELECT td.id, td.name, COUNT(dep.depends_on_task_definition_id) AS parent_count
+		FROM task_definitions td
+		LEFT JOIN task_dependencies dep ON td.id = dep.task_definition_id
+		WHERE td.workflow_definition_id = $1
+		GROUP BY td.id, td.name
 	`
 	rows, err := tx.QueryContext(ctx, getTasks, definitionID)
 	if err != nil {
@@ -185,13 +189,14 @@ func (r *Repository) CreateWorkflowRun(ctx context.Context, definitionID string,
 	defer rows.Close()
 
 	type taskInfo struct {
-		id   string
-		name string
+		id          string
+		name        string
+		parentCount int
 	}
 	var tasks []taskInfo
 	for rows.Next() {
 		var t taskInfo
-		if err := rows.Scan(&t.id, &t.name); err != nil {
+		if err := rows.Scan(&t.id, &t.name, &t.parentCount); err != nil {
 			return nil, fmt.Errorf("failed to scan task definition: %w", err)
 		}
 		tasks = append(tasks, t)
@@ -216,18 +221,22 @@ func (r *Repository) CreateWorkflowRun(ctx context.Context, definitionID string,
 		return nil, fmt.Errorf("failed to insert workflow run: %w", err)
 	}
 
-	// 4. Create Task Runs (all start in PENDING state)
+	// 4. Create Task Runs (root tasks start in READY state, others in PENDING state)
 	const insertTaskRun = `
 		INSERT INTO task_runs (id, workflow_run_id, task_definition_id, status, attempts, input, output, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
 	for _, t := range tasks {
 		taskRunID := newUUID()
+		status := model.TaskPending
+		if t.parentCount == 0 {
+			status = model.TaskReady
+		}
 		_, err = tx.ExecContext(ctx, insertTaskRun,
 			taskRunID,
 			runID,
 			t.id,
-			model.TaskPending,
+			status,
 			0,
 			json.RawMessage("{}"),
 			json.RawMessage("{}"),

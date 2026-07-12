@@ -70,9 +70,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
     completed_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT unique_run_task_def UNIQUE (workflow_run_id, task_definition_id),
-    CONSTRAINT chk_task_run_status CHECK (status IN ('PENDING', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'TIMED_OUT')),
+    CONSTRAINT chk_task_run_status CHECK (status IN ('PENDING', 'READY', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'TIMED_OUT')),
     CONSTRAINT chk_task_run_attempts CHECK (attempts >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_runs_status_retry ON task_runs(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_run ON task_runs(workflow_run_id);
+
+-- Ensure the task_runs constraint is updated to support READY state in existing databases
+ALTER TABLE task_runs DROP CONSTRAINT IF EXISTS chk_task_run_status;
+ALTER TABLE task_runs ADD CONSTRAINT chk_task_run_status CHECK (status IN ('PENDING', 'READY', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'TIMED_OUT'));

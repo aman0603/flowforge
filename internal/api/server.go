@@ -35,7 +35,7 @@ func NewServer(cfg *config.Config, repo *repository.Repository) *Server {
 // registerRoutes sets up the endpoints.
 func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /health", s.handleHealth)
-	s.router.HandleFunc("POST /definitions", s.handleCreateDefinition)
+	s.router.HandleFunc("POST /api/v1/workflows", s.handleCreateDefinition)
 	s.router.HandleFunc("POST /runs", s.handleCreateRun)
 	s.router.HandleFunc("GET /runs/{id}", s.handleGetRunDetails)
 }

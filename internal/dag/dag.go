@@ -37,6 +37,9 @@ func Validate(req *model.CreateDefinitionRequest) error {
 			adj[t.Name] = []string{}
 		}
 		for _, dep := range t.Dependencies {
+			if dep == t.Name {
+				return fmt.Errorf("task %q cannot depend on itself", t.Name)
+			}
 			if !taskMap[dep] {
 				return fmt.Errorf("task %q depends on non-existent task %q", t.Name, dep)
 			}

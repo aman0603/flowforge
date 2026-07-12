@@ -50,7 +50,7 @@ All requests and responses use JSON format.
 
 ### 2. Register Workflow Definition
 Registers a new workflow template and validates that its tasks form a valid Directed Acyclic Graph (DAG) with no cycles.
-* **Endpoint:** `POST /definitions`
+* **Endpoint:** `POST /api/v1/workflows`
 * **Request Body:**
   ```json
   {
