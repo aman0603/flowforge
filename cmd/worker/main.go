@@ -39,13 +39,49 @@ func main() {
 		}
 	}
 
-	// 4. Register Executors
+	// 4. Parse Recovery Configuration
+	claimedStaleTimeout := 30 * time.Second
+	if val := os.Getenv("CLAIMED_STALE_TIMEOUT"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			claimedStaleTimeout = d
+		} else {
+			log.Printf("[worker-%s] Warning: failed to parse CLAIMED_STALE_TIMEOUT %q, using default 30s", workerID, val)
+		}
+	}
+
+	runningStaleTimeout := 5 * time.Minute
+	if val := os.Getenv("RUNNING_STALE_TIMEOUT"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			runningStaleTimeout = d
+		} else {
+			log.Printf("[worker-%s] Warning: failed to parse RUNNING_STALE_TIMEOUT %q, using default 5m", workerID, val)
+		}
+	}
+
+	recoveryInterval := 30 * time.Second
+	if val := os.Getenv("RECOVERY_INTERVAL"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			recoveryInterval = d
+		} else {
+			log.Printf("[worker-%s] Warning: failed to parse RECOVERY_INTERVAL %q, using default 30s", workerID, val)
+		}
+	}
+
+	// 5. Register Executors
 	executors := map[string]worker.Executor{
 		"SLEEP": worker.NewSleepExecutor(),
 	}
 
-	// 5. Construct Worker
-	w := worker.New(workerID, repo, executors, pollInterval)
+	// 6. Construct Worker
+	w := worker.New(
+		workerID,
+		repo,
+		executors,
+		pollInterval,
+		claimedStaleTimeout,
+		runningStaleTimeout,
+		recoveryInterval,
+	)
 
 	// 6. Signal-aware context for Graceful Shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

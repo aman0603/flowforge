@@ -24,6 +24,7 @@ const (
 	TaskFailed    = "FAILED"
 	TaskSkipped   = "SKIPPED"
 	TaskTimedOut  = "TIMED_OUT"
+	TaskRetryWait = "RETRY_WAIT"
 )
 
 // WorkflowDefinition represents a workflow template.
@@ -44,6 +45,7 @@ type TaskDefinition struct {
 	MaxRetries           int             `json:"max_retries"`
 	RetryBackoffMs       int             `json:"retry_backoff_ms"`
 	TimeoutMs            int             `json:"timeout_ms"`
+	Priority             int             `json:"priority"`
 	CreatedAt            time.Time       `json:"created_at"`
 }
 
@@ -93,6 +95,7 @@ type TaskDefinitionInput struct {
 	MaxRetries     int             `json:"max_retries"`
 	RetryBackoffMs int             `json:"retry_backoff_ms"`
 	TimeoutMs      int             `json:"timeout_ms"`
+	Priority       int             `json:"priority"`
 	Dependencies   []string        `json:"dependencies"` // List of parent task names
 }
 
@@ -125,4 +128,10 @@ type ClaimedTask struct {
 	Config           json.RawMessage `json:"config"`
 	Input            json.RawMessage `json:"input"`
 	TimeoutMs        int             `json:"timeout_ms"`
+}
+
+// RecoveryResult represents the outcome of a stale task recovery operation.
+type RecoveryResult struct {
+	ClaimedRecovered int64 `json:"claimed_recovered"`
+	RunningRecovered int64 `json:"running_recovered"`
 }

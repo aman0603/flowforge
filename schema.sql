@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS task_definitions (
     max_retries INT NOT NULL DEFAULT 3,
     retry_backoff_ms INT NOT NULL DEFAULT 1000,
     timeout_ms INT NOT NULL DEFAULT 60000,
+    priority INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT unique_workflow_task_name UNIQUE (workflow_definition_id, name),
     CONSTRAINT chk_max_retries CHECK (max_retries >= 0),
@@ -72,7 +73,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     completed_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT unique_run_task_def UNIQUE (workflow_run_id, task_definition_id),
-    CONSTRAINT chk_task_run_status CHECK (status IN ('PENDING', 'READY', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'TIMED_OUT')),
+    CONSTRAINT chk_task_run_status CHECK (status IN ('PENDING', 'READY', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED', 'TIMED_OUT', 'RETRY_WAIT')),
     CONSTRAINT chk_task_run_attempts CHECK (attempts >= 0)
 );
 

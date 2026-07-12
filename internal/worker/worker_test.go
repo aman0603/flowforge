@@ -17,7 +17,7 @@ type fakeRepository struct {
 	claimFunc      func(ctx context.Context, workerID string) (*model.ClaimedTask, error)
 	startFunc      func(ctx context.Context, taskRunID string, workerID string) error
 	completeFunc   func(ctx context.Context, taskRunID string, workerID string, output json.RawMessage) error
-	failFunc       func(ctx context.Context, taskRunID string, workerID string, errMsg string) error
+	failFunc       func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error
 	startedCalls   int
 	completedCalls int
 	failedCalls    int
@@ -52,14 +52,22 @@ func (f *fakeRepository) MarkTaskRunCompleted(ctx context.Context, taskRunID str
 	return nil
 }
 
-func (f *fakeRepository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string) error {
+func (f *fakeRepository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failedCalls++
 	if f.failFunc != nil {
-		return f.failFunc(ctx, taskRunID, workerID, errMsg)
+		return f.failFunc(ctx, taskRunID, workerID, errMsg, isTimeout)
 	}
 	return nil
+}
+
+func (f *fakeRepository) RecoverStaleTasks(ctx context.Context, claimedTimeout time.Duration, runningTimeout time.Duration) (model.RecoveryResult, error) {
+	return model.RecoveryResult{}, nil
+}
+
+func (f *fakeRepository) PromoteDueRetries(ctx context.Context) (int64, error) {
+	return 0, nil
 }
 
 type fakeExecutor struct {
@@ -79,7 +87,7 @@ func TestWorkerOrchestration(t *testing.T) {
 		executors := map[string]Executor{
 			"SLEEP": &fakeExecutor{},
 		}
-		w := New("test-worker", repo, executors, 1*time.Millisecond)
+		w := New("test-worker", repo, executors, 1*time.Millisecond, 0, 0, 0)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
@@ -121,7 +129,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
 		ctx, cancel := context.WithCancel(context.Background())
 
 		// Cancel context in a background routine after processing starts
@@ -170,7 +178,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -208,7 +216,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{}, 1*time.Millisecond, 0, 0, 0)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -246,7 +254,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond, 0, 0, 0)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -279,14 +287,16 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
+		ctx, cancel := context.WithCancel(context.Background())
 		exec := &fakeExecutor{
-			executeFunc: func(ctx context.Context, task *model.ClaimedTask) (json.RawMessage, error) {
-				return nil, context.Canceled // Interrupted by shutdown context
+			executeFunc: func(c context.Context, task *model.ClaimedTask) (json.RawMessage, error) {
+				cancel() // Trigger cancel during execution simulation
+				return nil, context.Canceled
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
-		err := w.Run(context.Background()) // Note: context.Canceled returned by executor acts as cancellation check
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
+		err := w.Run(ctx)
 		if err != nil {
 			t.Fatalf("expected nil error on shutdown, got: %v", err)
 		}
@@ -307,7 +317,7 @@ func TestWorkerOrchestration(t *testing.T) {
 				return nil, errors.New("infrastructure database failure")
 			},
 		}
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond, 0, 0, 0)
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on claim DB error, got nil")
@@ -327,7 +337,7 @@ func TestWorkerOrchestration(t *testing.T) {
 				return errors.New("completion persistence failure")
 			},
 		}
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond, 0, 0, 0)
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on completion DB failure, got nil")
@@ -343,7 +353,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			claimFunc: func(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
 				return claimedTask, nil
 			},
-			failFunc: func(ctx context.Context, taskRunID string, workerID string, errMsg string) error {
+			failFunc: func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error {
 				return errors.New("failure persistence failure")
 			},
 		}
@@ -352,7 +362,7 @@ func TestWorkerOrchestration(t *testing.T) {
 				return nil, errors.New("execution error")
 			},
 		}
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
+		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on failure DB failure, got nil")

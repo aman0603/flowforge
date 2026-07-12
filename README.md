@@ -6,7 +6,7 @@ PostgreSQL is the durable source of truth for execution states, while future pha
 
 ---
 
-## Architecture Diagram (Current Phase 1 Status)
+## Architecture Diagram (Current Phase 5 Status)
 
 ```mermaid
 graph TD
@@ -14,9 +14,14 @@ graph TD
     API -->|Validate DAG| DAG[DAG Validator]
     API -->|Transactional Write| DB[(PostgreSQL)]
     
-    subgraph Local Workspace
-        API
-        DAG
+    DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W1[Worker 1]
+    DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W2[Worker 2]
+    DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W3[Worker 3]
+
+    subgraph Workers
+        W1
+        W2
+        W3
     end
 ```
 
@@ -150,11 +155,11 @@ Queries the execution progress and state of all task runs for a given workflow r
 ## How to Run & Build
 
 ### Using Docker (Recommended)
-We use Docker Compose to manage PostgreSQL and the API server. The database schema is automatically executed and updated on startup.
+We use Docker Compose to manage PostgreSQL, the API server, and 3 workers.
 
 ```bash
-# Start all containers in the foreground
-docker compose up --build
+# Start all containers in the foreground with 3 concurrent workers
+docker compose up --build --scale worker=3
 
 # Shutdown and clean volumes
 docker compose down -v
@@ -171,6 +176,10 @@ export SCHEMA_PATH="schema.sql"
 
 # Run the server
 go run cmd/flowforge/main.go
+
+# Start a worker process locally
+export WORKER_ID="local-worker-1"
+go run cmd/worker/main.go
 ```
 
 ---
@@ -185,4 +194,67 @@ go test -v ./...
 
 # Run unit tests with Go's race detector enabled
 go test -race ./...
+
+# Run integration tests against a running PostgreSQL test database
+TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" go test -tags=integration -v ./internal/repository
+
+# Run integration tests with Go's race detector enabled
+TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" go test -tags=integration -race -v ./internal/repository
 ```
+
+---
+
+## Concurrency & Execution Semantics
+
+### 1. Multi-Worker Task Distribution
+FlowForge utilizes PostgreSQL `FOR UPDATE SKIP LOCKED` inside a transaction within `ClaimNextReadyTask`. This allows multiple workers to claim ready tasks concurrently without conflicts or double-claiming. 
+
+### 2. Workflow-Level Lock Serialization
+To ensure DAG progression correctness (such as Diamond DAG sibling completion race conditions), all transitions affecting workflow progression (`MarkTaskRunCompleted` and `MarkTaskRunFailed`) exclusively lock the parent `workflow_runs` row:
+```sql
+SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE
+```
+This forces all completion/failure transactions for the same workflow to serialize, keeping sibling completions completely safe and deterministic.
+
+### 3. Worker Ownership Fencing
+Workers acquire tasks and stamp their unique `worker_id` (generated via container hostname and UUID). All subsequent task mutations (`StartTaskRun`, `MarkTaskRunCompleted`, `MarkTaskRunFailed`) are guarded by checking:
+```sql
+WHERE worker_id = $workerID AND status = $expectedStatus
+```
+This prevents hijacked execution or split-brain transitions.
+
+### 4. Stale Task Crash Recovery
+Workers run a background context-aware stale-task recovery loop.
+* **Stale CLAIMED Reset:** Tasks stuck in `CLAIMED` status longer than `CLAIMED_STALE_TIMEOUT` (default `30s`) are reset back to `READY` (clearing `worker_id` and `claimed_at`).
+* **Stale RUNNING Reset:** Tasks stuck in `RUNNING` status longer than `RUNNING_STALE_TIMEOUT` (default `5m`) are reset back to `READY` (clearing `worker_id`, `claimed_at`, `started_at`, and resetting execution-result fields to default).
+
+### 5. Automatic Retries and Exponential Backoff
+When task execution fails or times out, and its execution `attempts <= max_retries`, FlowForge schedules a retry:
+* The task status transitions to `RETRY_WAIT`.
+* The parent workflow run remains `RUNNING`, and all downstream child tasks remain blocked in `PENDING`.
+* Next execution time is computed using exponential backoff: `delay = base_backoff * 2^(attempts-1)`, capped at 1 hour and bounded to prevent numeric overflow.
+* Once the backoff delay has elapsed, the background recovery routine promotes the task back to `READY`.
+
+### 6. Priority-Based Scheduling Preference
+Task execution selection prioritizes tasks with higher priority values:
+* Claiming queries select `READY` tasks ordered by `priority DESC` and then `created_at ASC` (FIFO tie-breaking).
+* Priority is a scheduling preference; already CLAIMED or RUNNING tasks are not preempted.
+* Priority does not bypass DAG dependencies (downstream dependent tasks remain blocked until all parents succeed).
+
+### 7. Task Execution Timeouts
+Workers enforce execution-level context timeouts based on the task's `timeout_ms` definition:
+* A timeout triggers context cancellation (`context.DeadlineExceeded`) on the executing task.
+* On timeout, the task consumes a retry attempt and transitions to `RETRY_WAIT` (if budget remains) or to terminal `TIMED_OUT` (if retry budget is exhausted).
+* Worker process graceful shutdown cancellations (`context.Canceled`) are distinguished from task execution timeouts, leaving the task in `RUNNING` for normal stale task recovery without consuming attempts.
+
+### 8. Delivery Semantics
+> [!IMPORTANT]
+> **FlowForge provides at-least-once execution semantics.**
+> Recovering a stale `RUNNING` task resets it back to `READY` to allow re-claiming and re-execution. If a worker crashed during execution or after completing side effects but before persisting the state, the task will execute again. Therefore, task executors that perform external side effects must be designed to be idempotent.
+
+### 9. Supported Executor Types
+* **`SLEEP`**: Basic executor that sleeps for the duration configured in `duration_ms`.
+
+### 10. Known Limitations
+* Crash recovery relies on static timeouts and periodic scans; a worker that is slow or temporarily network-partitioned may have its tasks reclaimed (resulting in concurrent duplicate executions). Leases and heartbeats are scheduled for future phases.
+

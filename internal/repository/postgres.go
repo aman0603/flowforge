@@ -96,8 +96,8 @@ func (r *Repository) CreateWorkflowDefinition(ctx context.Context, req *model.Cr
 	tasksToProcess := make([]taskWithDeps, len(req.Tasks))
 
 	const insertTask = `
-		INSERT INTO task_definitions (id, workflow_definition_id, name, task_type, config, max_retries, retry_backoff_ms, timeout_ms, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO task_definitions (id, workflow_definition_id, name, task_type, config, max_retries, retry_backoff_ms, timeout_ms, priority, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
 
 	for i, t := range req.Tasks {
@@ -123,6 +123,7 @@ func (r *Repository) CreateWorkflowDefinition(ctx context.Context, req *model.Cr
 			t.MaxRetries,
 			t.RetryBackoffMs,
 			t.TimeoutMs,
+			t.Priority,
 			now,
 		)
 		if err != nil {
@@ -293,7 +294,7 @@ func (r *Repository) GetWorkflowRunDetails(ctx context.Context, runID string) (*
 
 	// 2. Fetch Task Runs
 	const selectTaskRuns = `
-		SELECT id, workflow_run_id, task_definition_id, status, attempts, input, output, error_message, next_retry_at, started_at, completed_at, created_at
+		SELECT id, workflow_run_id, task_definition_id, status, attempts, input, output, error_message, next_retry_at, started_at, completed_at, created_at, worker_id, claimed_at
 		FROM task_runs
 		WHERE workflow_run_id = $1
 	`
@@ -319,6 +320,8 @@ func (r *Repository) GetWorkflowRunDetails(ctx context.Context, runID string) (*
 			&tr.StartedAt,
 			&tr.CompletedAt,
 			&tr.CreatedAt,
+			&tr.WorkerID,
+			&tr.ClaimedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan task run: %w", err)
@@ -346,12 +349,13 @@ func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*
 
 	const claimQuery = `
 		WITH next_task AS (
-			SELECT id 
-			FROM task_runs 
-			WHERE status = 'READY'
-			ORDER BY created_at ASC
+			SELECT tr.id 
+			FROM task_runs tr
+			JOIN task_definitions td ON tr.task_definition_id = td.id
+			WHERE tr.status = 'READY'
+			ORDER BY td.priority DESC, tr.created_at ASC
 			LIMIT 1
-			FOR UPDATE SKIP LOCKED
+			FOR UPDATE OF tr SKIP LOCKED
 		),
 		updated_task AS (
 			UPDATE task_runs
@@ -471,22 +475,38 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 		output = json.RawMessage("{}")
 	}
 
-	// 1. Guarded task completion & retrieve run and definition IDs
+	// 1. Read workflow_run_id without acquiring a row lock
+	var workflowRunID string
+	err = tx.QueryRowContext(ctx, "SELECT workflow_run_id FROM task_runs WHERE id = $1", taskRunID).Scan(&workflowRunID)
+	if err == sql.ErrNoRows {
+		return ErrInvalidTaskTransition
+	} else if err != nil {
+		return fmt.Errorf("failed to read workflow_run_id for task completion: %w", err)
+	}
+
+	// 2. Acquire the parent workflow-run row lock (blocks concurrent updates for the same workflow)
+	var wfLockedID string
+	err = tx.QueryRowContext(ctx, "SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", workflowRunID).Scan(&wfLockedID)
+	if err != nil {
+		return fmt.Errorf("failed to acquire workflow run lock: %w", err)
+	}
+
+	// 3. Guarded task completion & retrieve definition ID
 	const completeTaskQuery = `
 		UPDATE task_runs
 		SET status = 'COMPLETED', output = $1, error_message = NULL, completed_at = NOW()
 		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3
-		RETURNING workflow_run_id, task_definition_id
+		RETURNING task_definition_id
 	`
-	var workflowRunID, taskDefID string
-	err = tx.QueryRowContext(ctx, completeTaskQuery, output, taskRunID, workerID).Scan(&workflowRunID, &taskDefID)
+	var taskDefID string
+	err = tx.QueryRowContext(ctx, completeTaskQuery, output, taskRunID, workerID).Scan(&taskDefID)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
 		return fmt.Errorf("failed to update task run status: %w", err)
 	}
 
-	// 2. Unlock eligible direct child tasks (PENDING -> READY)
+	// 4. Unlock eligible direct child tasks (PENDING -> READY)
 	const unlockQuery = `
 		UPDATE task_runs
 		SET status = 'READY'
@@ -511,7 +531,7 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 		return fmt.Errorf("failed to unlock child tasks: %w", err)
 	}
 
-	// 3. Attempt workflow completion
+	// 5. Attempt workflow completion
 	const completeWorkflowQuery = `
 		UPDATE workflow_runs
 		SET status = 'COMPLETED', completed_at = NOW()
@@ -536,39 +556,117 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 	return nil
 }
 
-// MarkTaskRunFailed transitions a task from RUNNING to FAILED inside a transaction.
-// Atomically marks the parent workflow run as FAILED if it is in PENDING or RUNNING status.
-func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string) error {
+func calculateBackoff(baseBackoffMs int, attempts int) time.Duration {
+	if baseBackoffMs <= 0 {
+		baseBackoffMs = 1000 // default fallback
+	}
+	shift := attempts - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 30 {
+		shift = 30
+	}
+
+	multiplier := int64(1) << shift
+	delayMs := int64(baseBackoffMs) * multiplier
+
+	// Cap max backoff to 1 hour
+	maxBackoffMs := int64(3600 * 1000)
+	if delayMs > maxBackoffMs || delayMs < 0 {
+		delayMs = maxBackoffMs
+	}
+
+	return time.Duration(delayMs) * time.Millisecond
+}
+
+// MarkTaskRunFailed transitions a task from RUNNING to FAILED (or RETRY_WAIT, or TIMED_OUT) inside a transaction.
+// Atomically marks the parent workflow run as FAILED if retry budget is exhausted.
+func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start MarkTaskRunFailed transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// 1. Transition task status and retrieve workflow run ID
-	const failTaskQuery = `
-		UPDATE task_runs
-		SET status = 'FAILED', error_message = $1, completed_at = NOW()
-		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3
-		RETURNING workflow_run_id
-	`
+	// 1. Read task details and definition limits without locking
 	var workflowRunID string
-	err = tx.QueryRowContext(ctx, failTaskQuery, errMsg, taskRunID, workerID).Scan(&workflowRunID)
+	var attempts, maxRetries, retryBackoff int
+	var currentStatus string
+	var currentWorkerID sql.NullString
+	const selectTaskInfo = `
+		SELECT tr.workflow_run_id, tr.attempts, td.max_retries, td.retry_backoff_ms, tr.status, tr.worker_id
+		FROM task_runs tr
+		JOIN task_definitions td ON tr.task_definition_id = td.id
+		WHERE tr.id = $1
+	`
+	err = tx.QueryRowContext(ctx, selectTaskInfo, taskRunID).Scan(&workflowRunID, &attempts, &maxRetries, &retryBackoff, &currentStatus, &currentWorkerID)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
-		return fmt.Errorf("failed to fail task run: %w", err)
+		return fmt.Errorf("failed to read task info for failure: %w", err)
 	}
 
-	// 2. Transition workflow status to FAILED only if current status is PENDING or RUNNING
-	const failWorkflowQuery = `
-		UPDATE workflow_runs
-		SET status = 'FAILED', completed_at = NOW(), error_message = $1
-		WHERE id = $2 AND status IN ('PENDING', 'RUNNING')
-	`
-	_, err = tx.ExecContext(ctx, failWorkflowQuery, "Task failed: "+errMsg, workflowRunID)
+	// Ownership and state validation
+	if currentStatus != "RUNNING" || !currentWorkerID.Valid || currentWorkerID.String != workerID {
+		return ErrInvalidTaskTransition
+	}
+
+	// 2. Acquire the parent workflow-run row lock to serialize workflow state updates
+	var wfLockedID string
+	err = tx.QueryRowContext(ctx, "SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE", workflowRunID).Scan(&wfLockedID)
 	if err != nil {
-		return fmt.Errorf("failed to update workflow status to FAILED: %w", err)
+		return fmt.Errorf("failed to acquire workflow run lock: %w", err)
+	}
+
+	// 3. Determine if retry budget remains
+	if attempts <= maxRetries {
+		// Retry budget remains! Transition to RETRY_WAIT
+		backoff := calculateBackoff(retryBackoff, attempts)
+		nextRetryAt := time.Now().Add(backoff)
+
+		const retryTaskQuery = `
+			UPDATE task_runs
+			SET status = 'RETRY_WAIT',
+				worker_id = NULL,
+				claimed_at = NULL,
+				started_at = NULL,
+				next_retry_at = $1,
+				error_message = $2
+			WHERE id = $3
+		`
+		_, err = tx.ExecContext(ctx, retryTaskQuery, nextRetryAt, errMsg, taskRunID)
+		if err != nil {
+			return fmt.Errorf("failed to schedule task retry: %w", err)
+		}
+	} else {
+		// Retry budget exhausted! Permanent task and workflow failure.
+		var terminalStatus string
+		if isTimeout {
+			terminalStatus = "TIMED_OUT"
+		} else {
+			terminalStatus = "FAILED"
+		}
+
+		const failTaskQuery = `
+			UPDATE task_runs
+			SET status = $1, error_message = $2, completed_at = NOW()
+			WHERE id = $3
+		`
+		_, err = tx.ExecContext(ctx, failTaskQuery, terminalStatus, errMsg, taskRunID)
+		if err != nil {
+			return fmt.Errorf("failed to fail task run: %w", err)
+		}
+
+		const failWorkflowQuery = `
+			UPDATE workflow_runs
+			SET status = 'FAILED', completed_at = NOW(), error_message = $1
+			WHERE id = $2 AND status IN ('PENDING', 'RUNNING')
+		`
+		_, err = tx.ExecContext(ctx, failWorkflowQuery, "Task failed: "+errMsg, workflowRunID)
+		if err != nil {
+			return fmt.Errorf("failed to update workflow status to FAILED: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -585,4 +683,98 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+// RecoverStaleTasks scans the database for stale CLAIMED and RUNNING tasks and resets them.
+func (r *Repository) RecoverStaleTasks(
+	ctx context.Context,
+	claimedTimeout time.Duration,
+	runningTimeout time.Duration,
+) (model.RecoveryResult, error) {
+	var res model.RecoveryResult
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return res, fmt.Errorf("failed to start stale task recovery transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Recover stale CLAIMED tasks
+	const recoverClaimedQuery = `
+		UPDATE task_runs tr
+		SET status = 'READY',
+			worker_id = NULL,
+			claimed_at = NULL
+		FROM workflow_runs wr
+		WHERE tr.workflow_run_id = wr.id
+		  AND tr.status = 'CLAIMED'
+		  AND tr.claimed_at < NOW() - ($1 * INTERVAL '1 second')
+		  AND wr.status IN ('PENDING', 'RUNNING')
+	`
+	claimedSecs := claimedTimeout.Seconds()
+	claimedRes, err := tx.ExecContext(ctx, recoverClaimedQuery, claimedSecs)
+	if err != nil {
+		return res, fmt.Errorf("failed to recover stale CLAIMED tasks: %w", err)
+	}
+	claimedCount, err := claimedRes.RowsAffected()
+	if err != nil {
+		return res, fmt.Errorf("failed to read claimed rows affected: %w", err)
+	}
+	res.ClaimedRecovered = claimedCount
+
+	// 2. Recover stale RUNNING tasks
+	const recoverRunningQuery = `
+		UPDATE task_runs tr
+		SET status = 'READY',
+			worker_id = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			output = '{}'::jsonb,
+			error_message = NULL,
+			completed_at = NULL
+		FROM workflow_runs wr
+		WHERE tr.workflow_run_id = wr.id
+		  AND tr.status = 'RUNNING'
+		  AND tr.started_at < NOW() - ($1 * INTERVAL '1 second')
+		  AND wr.status IN ('PENDING', 'RUNNING')
+	`
+	runningSecs := runningTimeout.Seconds()
+	runningRes, err := tx.ExecContext(ctx, recoverRunningQuery, runningSecs)
+	if err != nil {
+		return res, fmt.Errorf("failed to recover stale RUNNING tasks: %w", err)
+	}
+	runningCount, err := runningRes.RowsAffected()
+	if err != nil {
+		return res, fmt.Errorf("failed to read running rows affected: %w", err)
+	}
+	res.RunningRecovered = runningCount
+
+	if err := tx.Commit(); err != nil {
+		return res, fmt.Errorf("failed to commit stale task recovery transaction: %w", err)
+	}
+
+	return res, nil
+}
+
+// PromoteDueRetries transitions due tasks from RETRY_WAIT to READY.
+func (r *Repository) PromoteDueRetries(ctx context.Context) (int64, error) {
+	const promoteQuery = `
+		UPDATE task_runs tr
+		SET status = 'READY',
+			next_retry_at = NULL
+		FROM workflow_runs wr
+		WHERE tr.workflow_run_id = wr.id
+		  AND tr.status = 'RETRY_WAIT'
+		  AND tr.next_retry_at <= NOW()
+		  AND wr.status IN ('PENDING', 'RUNNING')
+	`
+	res, err := r.db.ExecContext(ctx, promoteQuery)
+	if err != nil {
+		return 0, fmt.Errorf("failed to promote due retries: %w", err)
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected for due retries: %w", err)
+	}
+	return count, nil
 }
