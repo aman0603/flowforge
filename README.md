@@ -247,14 +247,54 @@ Workers enforce execution-level context timeouts based on the task's `timeout_ms
 * On timeout, the task consumes a retry attempt and transitions to `RETRY_WAIT` (if budget remains) or to terminal `TIMED_OUT` (if retry budget is exhausted).
 * Worker process graceful shutdown cancellations (`context.Canceled`) are distinguished from task execution timeouts, leaving the task in `RUNNING` for normal stale task recovery without consuming attempts.
 
-### 8. Delivery Semantics
+### 8. Durable Attempt History
+FlowForge records details of every individual execution attempt of a task in the `task_attempts` table.
+* **Attempt Semantics:** Each `StartTaskRun` transaction atomically increments the task run's `attempts` count and inserts a corresponding `task_attempts` record with an incremented `attempt_number` and `RUNNING` status.
+* **Attempt Statuses:**
+  * `RUNNING`: The attempt is currently executing.
+  * `COMPLETED`: The attempt completed successfully.
+  * `FAILED`: The attempt failed with a normal execution error.
+  * `TIMED_OUT`: The attempt exceeded its execution timeout limit.
+  * `ORPHANED`: The worker process crashed or became slow, causing stale recovery to reclaim the task.
+* **Failure Classification:**
+  * `EXECUTION_ERROR`: Set on normal task execution failures.
+  * `TIMEOUT`: Set when the execution timeout is exceeded.
+  * `WORKER_LOST`: Set on `ORPHANED` attempts when the worker disappears.
+
+### 9. Dead-Letter Queue (DLQ)
+When a task run reaches an unrecoverable terminal execution state due to retry exhaustion (normal failures or timeouts), FlowForge writes a durable record to `dead_letter_tasks` in the same transaction as the task run terminal status update.
+* **Dead-letter conditions:** Tasks are only dead-lettered when they transition to terminal `FAILED` or `TIMED_OUT` states (i.e. retry budget exhausted).
+* **Uniqueness:** A unique index on `task_run_id` prevents duplicate DLQ records.
+* **Replay Support:** Replay is not automatically supported in Phase 7; it is deferred to future design.
+
+### 10. HTTP History & Observability APIs
+FlowForge provides REST endpoints to inspect execution history and terminal failures:
+* `GET /api/v1/runs/{run_id}/history`: Returns the complete history of a workflow run, including all its tasks and attempts.
+* `GET /api/v1/tasks/{task_run_id}/attempts`: Returns attempts for a task run ordered by `attempt_number ASC`.
+* `GET /api/v1/dead-letter`: Returns the paginated list of dead-lettered tasks.
+  * **Pagination:** Query parameters `limit` (default 50, max 100) and `offset` are validated and enforced.
+
+### 11. Delivery Semantics & Crash Windows
 > [!IMPORTANT]
 > **FlowForge provides at-least-once execution semantics.**
-> Recovering a stale `RUNNING` task resets it back to `READY` to allow re-claiming and re-execution. If a worker crashed during execution or after completing side effects but before persisting the state, the task will execute again. Therefore, task executors that perform external side effects must be designed to be idempotent.
+> Recovering a stale `RUNNING` task resets it back to `READY` to allow re-claiming and re-execution, and marks the failed attempt as `ORPHANED`. If a worker crashed during execution or after completing side effects but before persisting the state, the task will execute again. Therefore, task executors that perform external side effects must be designed to be idempotent.
 
-### 9. Supported Executor Types
+* **Crash Windows and Duplicate Execution:**
+  * *Window A (Duplicate Side Effects):* Executor completes external side effects -> Worker crashes before `COMPLETED` is persisted -> Stale recovery reclaims task and marks attempt `ORPHANED` -> Task runs again. (Idempotency required).
+  * *Window B (Stale Running Reclamation):* Worker starts execution -> Worker crashes -> Stale recovery transitions task to `READY` and attempt to `ORPHANED` -> Re-execution creates attempt 2.
+  * *Window C (Claimed Reclamation):* Worker crashes while task is `CLAIMED` before `StartTaskRun` -> Stale recovery transitions task to `READY` -> No attempt record is created (attempts count remains unchanged).
+  * *Window D (Terminal Transaction Crash):* Worker crashes mid-transaction when persisting terminal failure -> Database transaction rolls back completely (no partial terminal state or orphaned DLQ).
+
+### 12. Payload and Payload Size Limitations
+* **Large Payloads:** Task output (`output` JSONB) and error messages (`error_message` text) are stored in the database. Very large payloads can result in high memory consumption and latency. Object storage integration is deferred to future phases.
+* **Unbounded History:** Attempt history and DLQ logs grow indefinitely without an automatic retention service.
+
+### 13. API Security
+* APIs are currently unauthenticated. Production deployment requires external authentication proxies or gateways.
+
+### 14. Supported Executor Types
 * **`SLEEP`**: Basic executor that sleeps for the duration configured in `duration_ms`.
 
-### 10. Known Limitations
-* Crash recovery relies on static timeouts and periodic scans; a worker that is slow or temporarily network-partitioned may have its tasks reclaimed (resulting in concurrent duplicate executions). Leases and heartbeats are scheduled for future phases.
+### 15. Known Limitations
+* Crash recovery relies on static timeouts and periodic scans; leases and heartbeats are scheduled for future phases.
 

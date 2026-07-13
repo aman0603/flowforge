@@ -27,6 +27,23 @@ const (
 	TaskRetryWait = "RETRY_WAIT"
 )
 
+// Task attempt states
+const (
+	AttemptRunning   = "RUNNING"
+	AttemptCompleted = "COMPLETED"
+	AttemptFailed    = "FAILED"
+	AttemptTimedOut  = "TIMED_OUT"
+	AttemptOrphaned  = "ORPHANED"
+)
+
+// Failure classification types
+const (
+	FailureExecutionError = "EXECUTION_ERROR"
+	FailureTimeout        = "TIMEOUT"
+	FailureWorkerLost     = "WORKER_LOST"
+	FailureRetryExhausted = "RETRY_EXHAUSTED"
+)
+
 // WorkflowDefinition represents a workflow template.
 type WorkflowDefinition struct {
 	ID          string    `json:"id"`
@@ -134,4 +151,52 @@ type ClaimedTask struct {
 type RecoveryResult struct {
 	ClaimedRecovered int64 `json:"claimed_recovered"`
 	RunningRecovered int64 `json:"running_recovered"`
+}
+
+// TaskAttempt represents a single execution attempt of a task.
+type TaskAttempt struct {
+	ID            string          `json:"id"`
+	TaskRunID     string          `json:"task_run_id"`
+	WorkflowRunID string          `json:"workflow_run_id"`
+	AttemptNumber int             `json:"attempt_number"`
+	WorkerID      string          `json:"worker_id"`
+	Status        string          `json:"status"`
+	ClaimedAt     *time.Time      `json:"claimed_at,omitempty"`
+	StartedAt     time.Time       `json:"started_at"`
+	CompletedAt   *time.Time      `json:"completed_at,omitempty"`
+	DurationMs    *int64          `json:"duration_ms,omitempty"`
+	Output        json.RawMessage `json:"output"`
+	ErrorMessage  *string         `json:"error_message,omitempty"`
+	FailureType   *string         `json:"failure_type,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+// DeadLetterTask represents a terminally failed task run stored in the DLQ.
+type DeadLetterTask struct {
+	ID               string    `json:"id"`
+	TaskRunID        string    `json:"task_run_id"`
+	WorkflowRunID    string    `json:"workflow_run_id"`
+	TaskDefinitionID string    `json:"task_definition_id"`
+	TerminalStatus   string    `json:"terminal_status"`
+	FailureType      string    `json:"failure_type"`
+	Reason           *string   `json:"reason,omitempty"`
+	FinalAttempt     int       `json:"final_attempt"`
+	WorkerID         *string   `json:"worker_id,omitempty"`
+	DeadLetteredAt   time.Time `json:"dead_lettered_at"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// WorkflowHistoryResponse represents the execution history of a workflow run.
+type WorkflowHistoryResponse struct {
+	WorkflowRunID  string                `json:"workflow_run_id"`
+	WorkflowStatus string                `json:"workflow_status"`
+	Tasks          []TaskHistoryResponse `json:"tasks"`
+}
+
+// TaskHistoryResponse represents a task run and its execution attempts.
+type TaskHistoryResponse struct {
+	TaskRunID string        `json:"task_run_id"`
+	TaskName  string        `json:"task_name"`
+	Status    string        `json:"status"`
+	Attempts  []TaskAttempt `json:"attempts"`
 }

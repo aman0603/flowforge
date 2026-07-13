@@ -1132,10 +1132,10 @@ func TestCalculateBackoffHelper(t *testing.T) {
 		{1000, 2, 2000 * time.Millisecond},
 		{1000, 3, 4000 * time.Millisecond},
 		{1000, 4, 8000 * time.Millisecond},
-		{0, 1, 1000 * time.Millisecond},      // Fallback
-		{-500, 1, 1000 * time.Millisecond},   // Fallback
-		{1000, 0, 1000 * time.Millisecond},   // Shift bound check
-		{1000, -1, 1000 * time.Millisecond},  // Shift bound check
+		{0, 1, 1000 * time.Millisecond},            // Fallback
+		{-500, 1, 1000 * time.Millisecond},         // Fallback
+		{1000, 0, 1000 * time.Millisecond},         // Shift bound check
+		{1000, -1, 1000 * time.Millisecond},        // Shift bound check
 		{1000, 40, 3600 * 1000 * time.Millisecond}, // Cap check (1 hour)
 	}
 
@@ -1483,3 +1483,303 @@ func TestPriorityScheduling(t *testing.T) {
 	}
 }
 
+func TestTaskAttemptsSchema(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+
+	// 1. Create a dummy workflow definition and run to have a valid task run
+	req := &model.CreateDefinitionRequest{
+		Name:        "attempt-schema-test",
+		Description: "testing attempts schema constraints",
+		Tasks: []model.TaskDefinitionInput{
+			{
+				Name:           "TaskA",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     0,
+				RetryBackoffMs: 1000,
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+		},
+	}
+	def, err := repo.CreateWorkflowDefinition(ctx, req)
+	if err != nil {
+		t.Fatalf("failed to create workflow def: %v", err)
+	}
+
+	run, err := repo.CreateWorkflowRun(ctx, def.ID, nil)
+	if err != nil {
+		t.Fatalf("failed to create workflow run: %v", err)
+	}
+
+	// Get the task run ID
+	var taskRunID string
+	err = repo.db.QueryRowContext(ctx, "SELECT id FROM task_runs WHERE workflow_run_id = $1", run.ID).Scan(&taskRunID)
+	if err != nil {
+		t.Fatalf("failed to query task run: %v", err)
+	}
+
+	// 2. Insert valid task attempt
+	attemptID1 := newUUID()
+	_, err = repo.db.ExecContext(ctx, `
+		INSERT INTO task_attempts (id, task_run_id, workflow_run_id, attempt_number, worker_id, status, started_at)
+		VALUES ($1, $2, $3, 1, 'worker-1', 'RUNNING', NOW())
+	`, attemptID1, taskRunID, run.ID)
+	if err != nil {
+		t.Fatalf("failed to insert valid task attempt: %v", err)
+	}
+
+	// 3. Try to insert duplicate attempt_number for the same task run (must fail unique constraint)
+	attemptID2 := newUUID()
+	_, err = repo.db.ExecContext(ctx, `
+		INSERT INTO task_attempts (id, task_run_id, workflow_run_id, attempt_number, worker_id, status, started_at)
+		VALUES ($1, $2, $3, 1, 'worker-1', 'RUNNING', NOW())
+	`, attemptID2, taskRunID, run.ID)
+	if err == nil {
+		t.Errorf("expected unique constraint violation, but got nil error")
+	}
+
+	// 4. Try to insert invalid status (must fail CHECK constraint)
+	attemptID3 := newUUID()
+	_, err = repo.db.ExecContext(ctx, `
+		INSERT INTO task_attempts (id, task_run_id, workflow_run_id, attempt_number, worker_id, status, started_at)
+		VALUES ($1, $2, $3, 2, 'worker-1', 'INVALID_STATUS', NOW())
+	`, attemptID3, taskRunID, run.ID)
+	if err == nil {
+		t.Errorf("expected chk_attempt_status violation, but got nil error")
+	}
+}
+
+func TestTaskAttemptsIntegration(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+
+	// Register workflow with a sleep task (allowing retries)
+	req := &model.CreateDefinitionRequest{
+		Name:        "integration-test-attempts",
+		Description: "testing attempt history generation",
+		Tasks: []model.TaskDefinitionInput{
+			{
+				Name:           "TaskA",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     2,
+				RetryBackoffMs: 100,
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+		},
+	}
+	def, err := repo.CreateWorkflowDefinition(ctx, req)
+	if err != nil {
+		t.Fatalf("failed to create workflow def: %v", err)
+	}
+
+	// === 1. Success Flow ===
+	_, _ = repo.CreateWorkflowRun(ctx, def.ID, nil)
+	claimed, _ := repo.ClaimNextReadyTask(ctx, "worker-1")
+	err = repo.StartTaskRun(ctx, claimed.TaskRunID, "worker-1")
+	if err != nil {
+		t.Fatalf("failed to start task run: %v", err)
+	}
+
+	// Verify attempt 1 was created as RUNNING
+	var status string
+	var attemptNum int
+	var workerID string
+	err = repo.db.QueryRowContext(ctx, "SELECT status, attempt_number, worker_id FROM task_attempts WHERE task_run_id = $1", claimed.TaskRunID).Scan(&status, &attemptNum, &workerID)
+	if err != nil {
+		t.Fatalf("failed to query task attempts: %v", err)
+	}
+	if status != "RUNNING" || attemptNum != 1 || workerID != "worker-1" {
+		t.Errorf("unexpected attempt state: status=%s, attemptNum=%d, workerID=%s", status, attemptNum, workerID)
+	}
+
+	// Complete task run
+	_ = repo.MarkTaskRunCompleted(ctx, claimed.TaskRunID, "worker-1", json.RawMessage(`{"data":"ok"}`))
+
+	// Verify attempt transitioned to COMPLETED
+	var output json.RawMessage
+	err = repo.db.QueryRowContext(ctx, "SELECT status, output FROM task_attempts WHERE task_run_id = $1", claimed.TaskRunID).Scan(&status, &output)
+	if err != nil {
+		t.Fatalf("failed to query attempt: %v", err)
+	}
+	if status != "COMPLETED" || string(output) != `{"data": "ok"}` {
+		t.Errorf("unexpected completed attempt state: status=%s, output=%s", status, output)
+	}
+
+	// === 2. Retry, Fail, Timeout Flow ===
+	_, _ = repo.CreateWorkflowRun(ctx, def.ID, nil)
+	claimed2, _ := repo.ClaimNextReadyTask(ctx, "worker-2")
+
+	// Attempt 1: Start and fail normally
+	_ = repo.StartTaskRun(ctx, claimed2.TaskRunID, "worker-2")
+	_ = repo.MarkTaskRunFailed(ctx, claimed2.TaskRunID, "worker-2", "execution failed", false)
+
+	// Verify attempt 1 is FAILED
+	var failureType string
+	err = repo.db.QueryRowContext(ctx, "SELECT status, failure_type FROM task_attempts WHERE task_run_id = $1 AND attempt_number = 1", claimed2.TaskRunID).Scan(&status, &failureType)
+	if err != nil {
+		t.Fatalf("failed to query attempt 1: %v", err)
+	}
+	if status != "FAILED" || failureType != "EXECUTION_ERROR" {
+		t.Errorf("unexpected attempt 1 fail state: status=%s, failureType=%s", status, failureType)
+	}
+
+	// Promote and start attempt 2
+	_, _ = repo.db.ExecContext(ctx, "UPDATE task_runs SET next_retry_at = NOW() - INTERVAL '10 seconds' WHERE id = $1", claimed2.TaskRunID)
+	_, _ = repo.PromoteDueRetries(ctx)
+	claimed2_retry, _ := repo.ClaimNextReadyTask(ctx, "worker-2")
+	_ = repo.StartTaskRun(ctx, claimed2_retry.TaskRunID, "worker-2")
+
+	// Verify attempt 2 was created as RUNNING
+	err = repo.db.QueryRowContext(ctx, "SELECT status, attempt_number FROM task_attempts WHERE task_run_id = $1 AND attempt_number = 2", claimed2.TaskRunID).Scan(&status, &attemptNum)
+	if err != nil {
+		t.Fatalf("failed to query attempt 2: %v", err)
+	}
+	if status != "RUNNING" || attemptNum != 2 {
+		t.Errorf("unexpected attempt 2 running state: status=%s, attemptNum=%d", status, attemptNum)
+	}
+
+	// Fail attempt 2 as Timeout
+	_ = repo.MarkTaskRunFailed(ctx, claimed2.TaskRunID, "worker-2", "execution timeout exceeded", true)
+
+	// Verify attempt 2 is TIMED_OUT
+	err = repo.db.QueryRowContext(ctx, "SELECT status, failure_type FROM task_attempts WHERE task_run_id = $1 AND attempt_number = 2", claimed2.TaskRunID).Scan(&status, &failureType)
+	if err != nil {
+		t.Fatalf("failed to query attempt 2 status: %v", err)
+	}
+	if status != "TIMED_OUT" || failureType != "TIMEOUT" {
+		t.Errorf("unexpected attempt 2 timeout state: status=%s, failureType=%s", status, failureType)
+	}
+
+	// === 3. Stale RUNNING Recovery Flow ===
+	_, _ = repo.CreateWorkflowRun(ctx, def.ID, nil)
+	claimed3, _ := repo.ClaimNextReadyTask(ctx, "worker-3")
+	_ = repo.StartTaskRun(ctx, claimed3.TaskRunID, "worker-3")
+
+	// Force task run to be stale
+	_, _ = repo.db.ExecContext(ctx, "UPDATE task_runs SET started_at = NOW() - INTERVAL '10 minutes' WHERE id = $1", claimed3.TaskRunID)
+
+	// Recover stale running task
+	recResult, err := repo.RecoverStaleTasks(ctx, 30*time.Second, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to recover stale tasks: %v", err)
+	}
+	if recResult.RunningRecovered != 1 {
+		t.Errorf("expected 1 running task to be recovered, got %d", recResult.RunningRecovered)
+	}
+
+	// Verify attempt 1 was marked as ORPHANED with failure_type WORKER_LOST
+	err = repo.db.QueryRowContext(ctx, "SELECT status, failure_type FROM task_attempts WHERE task_run_id = $1 AND attempt_number = 1", claimed3.TaskRunID).Scan(&status, &failureType)
+	if err != nil {
+		t.Fatalf("failed to query attempt status after recovery: %v", err)
+	}
+	if status != "ORPHANED" || failureType != "WORKER_LOST" {
+		t.Errorf("unexpected recovered attempt state: status=%s, failureType=%s", status, failureType)
+	}
+
+	// Re-claim and re-start task
+	reClaimed, _ := repo.ClaimNextReadyTask(ctx, "worker-4")
+	_ = repo.StartTaskRun(ctx, reClaimed.TaskRunID, "worker-4")
+
+	// Verify attempt 2 was created as RUNNING
+	err = repo.db.QueryRowContext(ctx, "SELECT status, attempt_number, worker_id FROM task_attempts WHERE task_run_id = $1 AND attempt_number = 2", claimed3.TaskRunID).Scan(&status, &attemptNum, &workerID)
+	if err != nil {
+		t.Fatalf("failed to query attempt 2: %v", err)
+	}
+	if status != "RUNNING" || attemptNum != 2 || workerID != "worker-4" {
+		t.Errorf("unexpected attempt 2 state: status=%s, attemptNum=%d, workerID=%s", status, attemptNum, workerID)
+	}
+
+	// === 4. Stale CLAIMED Recovery Flow (no attempt created) ===
+	_, _ = repo.CreateWorkflowRun(ctx, def.ID, nil)
+	claimed4, _ := repo.ClaimNextReadyTask(ctx, "worker-5")
+
+	// Force claimed task to be stale
+	_, _ = repo.db.ExecContext(ctx, "UPDATE task_runs SET claimed_at = NOW() - INTERVAL '10 minutes' WHERE id = $1", claimed4.TaskRunID)
+
+	// Recover stale claimed task
+	recResult2, _ := repo.RecoverStaleTasks(ctx, 30*time.Second, 30*time.Second)
+	if recResult2.ClaimedRecovered != 1 {
+		t.Errorf("expected 1 claimed task to be recovered, got %d", recResult2.ClaimedRecovered)
+	}
+
+	// Verify no attempt record exists for claimed4
+	var count int
+	err = repo.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM task_attempts WHERE task_run_id = $1", claimed4.TaskRunID).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to query attempt count: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 attempt records, got %d", count)
+	}
+}
+
+func TestDLQIntegration(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+
+	// Register workflow with a sleep task (1 retry max)
+	req := &model.CreateDefinitionRequest{
+		Name:        "integration-test-dlq",
+		Description: "testing DLQ generation",
+		Tasks: []model.TaskDefinitionInput{
+			{
+				Name:           "TaskA",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				RetryBackoffMs: 100,
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+		},
+	}
+	def, err := repo.CreateWorkflowDefinition(ctx, req)
+	if err != nil {
+		t.Fatalf("failed to create workflow def: %v", err)
+	}
+
+	// Create run
+	_, _ = repo.CreateWorkflowRun(ctx, def.ID, nil)
+
+	// Attempt 1: Start and fail (retryable)
+	claimed, _ := repo.ClaimNextReadyTask(ctx, "worker-1")
+	_ = repo.StartTaskRun(ctx, claimed.TaskRunID, "worker-1")
+	_ = repo.MarkTaskRunFailed(ctx, claimed.TaskRunID, "worker-1", "attempt 1 error", false)
+
+	// Verify no DLQ record exists yet
+	var count int
+	_ = repo.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dead_letter_tasks WHERE task_run_id = $1", claimed.TaskRunID).Scan(&count)
+	if count != 0 {
+		t.Errorf("expected 0 DLQ records for retryable failure, got %d", count)
+	}
+
+	// Promote and start attempt 2 (final attempt)
+	_, _ = repo.db.ExecContext(ctx, "UPDATE task_runs SET next_retry_at = NOW() - INTERVAL '10 seconds' WHERE id = $1", claimed.TaskRunID)
+	_, _ = repo.PromoteDueRetries(ctx)
+	claimed_retry, _ := repo.ClaimNextReadyTask(ctx, "worker-1")
+	_ = repo.StartTaskRun(ctx, claimed_retry.TaskRunID, "worker-1")
+
+	// Fail attempt 2 (terminal timeout)
+	_ = repo.MarkTaskRunFailed(ctx, claimed.TaskRunID, "worker-1", "attempt 2 timeout exceeded", true)
+
+	// Verify exactly one DLQ record exists
+	var taskRunID, workflowRunID, terminalStatus, failureType, reason, workerID string
+	var finalAttempt int
+	err = repo.db.QueryRowContext(ctx, `
+		SELECT task_run_id, workflow_run_id, terminal_status, failure_type, reason, final_attempt, worker_id
+		FROM dead_letter_tasks
+		WHERE task_run_id = $1
+	`, claimed.TaskRunID).Scan(&taskRunID, &workflowRunID, &terminalStatus, &failureType, &reason, &finalAttempt, &workerID)
+	if err != nil {
+		t.Fatalf("failed to query DLQ record: %v", err)
+	}
+
+	if taskRunID != claimed.TaskRunID || terminalStatus != "TIMED_OUT" || failureType != "TIMEOUT" || reason != "attempt 2 timeout exceeded" || finalAttempt != 2 || workerID != "worker-1" {
+		t.Errorf("unexpected DLQ record fields: taskRunID=%s, terminalStatus=%s, failureType=%s, reason=%s, finalAttempt=%d, workerID=%s",
+			taskRunID, terminalStatus, failureType, reason, finalAttempt, workerID)
+	}
+}

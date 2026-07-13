@@ -23,6 +23,11 @@ type Repository struct {
 	db *sql.DB
 }
 
+// DB returns the underlying sql.DB connection (mainly for testing).
+func (r *Repository) DB() *sql.DB {
+	return r.db
+}
+
 // New initializes a new Postgres Repository and connects to the database.
 func New(dbURL string) (*Repository, error) {
 	db, err := sql.Open("postgres", dbURL)
@@ -429,28 +434,37 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 			  WHERE wr.id = tr.workflow_run_id
 				AND wr.status IN ('PENDING', 'RUNNING')
 		  )
+		RETURNING tr.workflow_run_id, tr.attempts, tr.claimed_at
 	`
-	res, err := tx.ExecContext(ctx, updateTaskQuery, taskRunID, workerID)
-	if err != nil {
+	var workflowRunID string
+	var newAttempts int
+	var claimedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, updateTaskQuery, taskRunID, workerID).Scan(&workflowRunID, &newAttempts, &claimedAt)
+	if err == sql.ErrNoRows {
+		return ErrInvalidTaskTransition
+	} else if err != nil {
 		return fmt.Errorf("failed to update task run to RUNNING: %w", err)
 	}
 
-	rows, err := res.RowsAffected()
+	// 1.5 Create task_attempt record
+	attemptID := newUUID()
+	const insertAttemptQuery = `
+		INSERT INTO task_attempts (id, task_run_id, workflow_run_id, attempt_number, worker_id, status, claimed_at, started_at)
+		VALUES ($1, $2, $3, $4, $5, 'RUNNING', $6, NOW())
+	`
+	_, err = tx.ExecContext(ctx, insertAttemptQuery, attemptID, taskRunID, workflowRunID, newAttempts, workerID, claimedAt)
 	if err != nil {
-		return fmt.Errorf("failed to check task rows affected: %w", err)
-	}
-	if rows == 0 {
-		return ErrInvalidTaskTransition
+		return fmt.Errorf("failed to insert task attempt: %w", err)
 	}
 
 	// 2. Transition workflow PENDING -> RUNNING
 	const updateWorkflowQuery = `
 		UPDATE workflow_runs
 		SET status = 'RUNNING', started_at = NOW()
-		WHERE id = (SELECT workflow_run_id FROM task_runs WHERE id = $1)
+		WHERE id = $1
 		  AND status = 'PENDING'
 	`
-	_, err = tx.ExecContext(ctx, updateWorkflowQuery, taskRunID)
+	_, err = tx.ExecContext(ctx, updateWorkflowQuery, workflowRunID)
 	if err != nil {
 		return fmt.Errorf("failed to update workflow run to RUNNING: %w", err)
 	}
@@ -491,19 +505,31 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 		return fmt.Errorf("failed to acquire workflow run lock: %w", err)
 	}
 
-	// 3. Guarded task completion & retrieve definition ID
+	// 3. Guarded task completion & retrieve definition ID and attempts
 	const completeTaskQuery = `
 		UPDATE task_runs
 		SET status = 'COMPLETED', output = $1, error_message = NULL, completed_at = NOW()
 		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3
-		RETURNING task_definition_id
+		RETURNING task_definition_id, attempts
 	`
 	var taskDefID string
-	err = tx.QueryRowContext(ctx, completeTaskQuery, output, taskRunID, workerID).Scan(&taskDefID)
+	var attempts int
+	err = tx.QueryRowContext(ctx, completeTaskQuery, output, taskRunID, workerID).Scan(&taskDefID, &attempts)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
 		return fmt.Errorf("failed to update task run status: %w", err)
+	}
+
+	// 3.5 Update corresponding task attempt
+	const completeAttemptQuery = `
+		UPDATE task_attempts
+		SET status = 'COMPLETED', completed_at = NOW(), output = $1
+		WHERE task_run_id = $2 AND attempt_number = $3
+	`
+	_, err = tx.ExecContext(ctx, completeAttemptQuery, output, taskRunID, attempts)
+	if err != nil {
+		return fmt.Errorf("failed to update task attempt status: %w", err)
 	}
 
 	// 4. Unlock eligible direct child tasks (PENDING -> READY)
@@ -619,6 +645,27 @@ func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, wo
 		return fmt.Errorf("failed to acquire workflow run lock: %w", err)
 	}
 
+	// 2.5 Update corresponding task attempt status
+	var attemptStatus string
+	var failureType string
+	if isTimeout {
+		attemptStatus = "TIMED_OUT"
+		failureType = "TIMEOUT"
+	} else {
+		attemptStatus = "FAILED"
+		failureType = "EXECUTION_ERROR"
+	}
+
+	const updateAttemptQuery = `
+		UPDATE task_attempts
+		SET status = $1, completed_at = NOW(), error_message = $2, failure_type = $3
+		WHERE task_run_id = $4 AND attempt_number = $5
+	`
+	_, err = tx.ExecContext(ctx, updateAttemptQuery, attemptStatus, errMsg, failureType, taskRunID, attempts)
+	if err != nil {
+		return fmt.Errorf("failed to update task attempt status: %w", err)
+	}
+
 	// 3. Determine if retry budget remains
 	if attempts <= maxRetries {
 		// Retry budget remains! Transition to RETRY_WAIT
@@ -652,10 +699,30 @@ func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, wo
 			UPDATE task_runs
 			SET status = $1, error_message = $2, completed_at = NOW()
 			WHERE id = $3
+			RETURNING task_definition_id
 		`
-		_, err = tx.ExecContext(ctx, failTaskQuery, terminalStatus, errMsg, taskRunID)
+		var taskDefID string
+		err = tx.QueryRowContext(ctx, failTaskQuery, terminalStatus, errMsg, taskRunID).Scan(&taskDefID)
 		if err != nil {
 			return fmt.Errorf("failed to fail task run: %w", err)
+		}
+
+		// Insert Dead-Letter tasks record atomically
+		dlqID := newUUID()
+		var failureType string
+		if isTimeout {
+			failureType = "TIMEOUT"
+		} else {
+			failureType = "EXECUTION_ERROR"
+		}
+
+		const insertDLQQuery = `
+			INSERT INTO dead_letter_tasks (id, task_run_id, workflow_run_id, task_definition_id, terminal_status, failure_type, reason, final_attempt, worker_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`
+		_, err = tx.ExecContext(ctx, insertDLQQuery, dlqID, taskRunID, workflowRunID, taskDefID, terminalStatus, failureType, errMsg, attempts, workerID)
+		if err != nil {
+			return fmt.Errorf("failed to insert dead letter task: %w", err)
 		}
 
 		const failWorkflowQuery = `
@@ -737,17 +804,45 @@ func (r *Repository) RecoverStaleTasks(
 		  AND tr.status = 'RUNNING'
 		  AND tr.started_at < NOW() - ($1 * INTERVAL '1 second')
 		  AND wr.status IN ('PENDING', 'RUNNING')
+		RETURNING tr.id, tr.attempts
 	`
 	runningSecs := runningTimeout.Seconds()
-	runningRes, err := tx.ExecContext(ctx, recoverRunningQuery, runningSecs)
+	rows, err := tx.QueryContext(ctx, recoverRunningQuery, runningSecs)
 	if err != nil {
 		return res, fmt.Errorf("failed to recover stale RUNNING tasks: %w", err)
 	}
-	runningCount, err := runningRes.RowsAffected()
-	if err != nil {
-		return res, fmt.Errorf("failed to read running rows affected: %w", err)
+	defer rows.Close()
+
+	type recoveredTask struct {
+		id       string
+		attempts int
 	}
-	res.RunningRecovered = runningCount
+	var recovered []recoveredTask
+	for rows.Next() {
+		var rt recoveredTask
+		if err := rows.Scan(&rt.id, &rt.attempts); err != nil {
+			return res, fmt.Errorf("failed to scan recovered task: %w", err)
+		}
+		recovered = append(recovered, rt)
+	}
+	if err := rows.Err(); err != nil {
+		return res, fmt.Errorf("error iterating recovered task rows: %w", err)
+	}
+
+	res.RunningRecovered = int64(len(recovered))
+
+	// Update corresponding task attempts to ORPHANED
+	const orphanAttemptsQuery = `
+		UPDATE task_attempts
+		SET status = 'ORPHANED', completed_at = NOW(), failure_type = 'WORKER_LOST', error_message = 'worker execution became stale'
+		WHERE task_run_id = $1 AND attempt_number = $2 AND status = 'RUNNING'
+	`
+	for _, rt := range recovered {
+		_, err = tx.ExecContext(ctx, orphanAttemptsQuery, rt.id, rt.attempts)
+		if err != nil {
+			return res, fmt.Errorf("failed to orphan task attempt for task %s, attempt %d: %w", rt.id, rt.attempts, err)
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return res, fmt.Errorf("failed to commit stale task recovery transaction: %w", err)
@@ -777,4 +872,204 @@ func (r *Repository) PromoteDueRetries(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("failed to get rows affected for due retries: %w", err)
 	}
 	return count, nil
+}
+
+// GetWorkflowRunHistory retrieves the history of a workflow run and all its attempts.
+func (r *Repository) GetWorkflowRunHistory(ctx context.Context, runID string) (*model.WorkflowHistoryResponse, error) {
+	// Query the workflow run details
+	var wfStatus string
+	err := r.db.QueryRowContext(ctx, "SELECT status FROM workflow_runs WHERE id = $1", runID).Scan(&wfStatus)
+	if err == sql.ErrNoRows {
+		return nil, sql.ErrNoRows
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to query workflow run for history: %w", err)
+	}
+
+	// Query task runs
+	const queryTasks = `
+		SELECT tr.id, td.name, tr.status
+		FROM task_runs tr
+		JOIN task_definitions td ON tr.task_definition_id = td.id
+		WHERE tr.workflow_run_id = $1
+		ORDER BY tr.created_at ASC
+	`
+	rows, err := r.db.QueryContext(ctx, queryTasks, runID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query task runs for history: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []model.TaskHistoryResponse
+	for rows.Next() {
+		var t model.TaskHistoryResponse
+		if err := rows.Scan(&t.TaskRunID, &t.TaskName, &t.Status); err != nil {
+			return nil, fmt.Errorf("failed to scan task run: %w", err)
+		}
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating task runs: %w", err)
+	}
+
+	// Query attempts for all task runs of this workflow
+	const queryAttempts = `
+		SELECT id, task_run_id, workflow_run_id, attempt_number, worker_id, status, claimed_at, started_at, completed_at, output, error_message, failure_type, created_at
+		FROM task_attempts
+		WHERE workflow_run_id = $1
+		ORDER BY attempt_number ASC
+	`
+	attRows, err := r.db.QueryContext(ctx, queryAttempts, runID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query task attempts for history: %w", err)
+	}
+	defer attRows.Close()
+
+	attemptsMap := make(map[string][]model.TaskAttempt)
+	for attRows.Next() {
+		var att model.TaskAttempt
+		var claimedAt, completedAt sql.NullTime
+		var errMsg, failureType sql.NullString
+		err := attRows.Scan(
+			&att.ID, &att.TaskRunID, &att.WorkflowRunID, &att.AttemptNumber,
+			&att.WorkerID, &att.Status, &claimedAt, &att.StartedAt, &completedAt,
+			&att.Output, &errMsg, &failureType, &att.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan task attempt: %w", err)
+		}
+		if claimedAt.Valid {
+			att.ClaimedAt = &claimedAt.Time
+		}
+		if completedAt.Valid {
+			att.CompletedAt = &completedAt.Time
+			dur := completedAt.Time.Sub(att.StartedAt).Milliseconds()
+			att.DurationMs = &dur
+		}
+		if errMsg.Valid {
+			att.ErrorMessage = &errMsg.String
+		}
+		if failureType.Valid {
+			att.FailureType = &failureType.String
+		}
+		attemptsMap[att.TaskRunID] = append(attemptsMap[att.TaskRunID], att)
+	}
+	if err := attRows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating task attempts: %w", err)
+	}
+
+	// Associate attempts with tasks
+	for i := range tasks {
+		atts, ok := attemptsMap[tasks[i].TaskRunID]
+		if !ok {
+			tasks[i].Attempts = []model.TaskAttempt{}
+		} else {
+			tasks[i].Attempts = atts
+		}
+	}
+
+	return &model.WorkflowHistoryResponse{
+		WorkflowRunID:  runID,
+		WorkflowStatus: wfStatus,
+		Tasks:          tasks,
+	}, nil
+}
+
+// GetTaskAttempts retrieves all attempts of a task run.
+func (r *Repository) GetTaskAttempts(ctx context.Context, taskRunID string) ([]model.TaskAttempt, error) {
+	// Verify task run exists
+	var dummy string
+	err := r.db.QueryRowContext(ctx, "SELECT id FROM task_runs WHERE id = $1", taskRunID).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return nil, sql.ErrNoRows
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to query task run: %w", err)
+	}
+
+	const queryAttempts = `
+		SELECT id, task_run_id, workflow_run_id, attempt_number, worker_id, status, claimed_at, started_at, completed_at, output, error_message, failure_type, created_at
+		FROM task_attempts
+		WHERE task_run_id = $1
+		ORDER BY attempt_number ASC
+	`
+	rows, err := r.db.QueryContext(ctx, queryAttempts, taskRunID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query task attempts: %w", err)
+	}
+	defer rows.Close()
+
+	var attempts []model.TaskAttempt
+	for rows.Next() {
+		var att model.TaskAttempt
+		var claimedAt, completedAt sql.NullTime
+		var errMsg, failureType sql.NullString
+		err := rows.Scan(
+			&att.ID, &att.TaskRunID, &att.WorkflowRunID, &att.AttemptNumber,
+			&att.WorkerID, &att.Status, &claimedAt, &att.StartedAt, &completedAt,
+			&att.Output, &errMsg, &failureType, &att.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan task attempt: %w", err)
+		}
+		if claimedAt.Valid {
+			att.ClaimedAt = &claimedAt.Time
+		}
+		if completedAt.Valid {
+			att.CompletedAt = &completedAt.Time
+			dur := completedAt.Time.Sub(att.StartedAt).Milliseconds()
+			att.DurationMs = &dur
+		}
+		if errMsg.Valid {
+			att.ErrorMessage = &errMsg.String
+		}
+		if failureType.Valid {
+			att.FailureType = &failureType.String
+		}
+		attempts = append(attempts, att)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating task attempts: %w", err)
+	}
+
+	return attempts, nil
+}
+
+// GetDeadLetterTasks lists tasks that failed terminally and are stored in the DLQ.
+func (r *Repository) GetDeadLetterTasks(ctx context.Context, limit, offset int) ([]model.DeadLetterTask, error) {
+	const queryDLQ = `
+		SELECT id, task_run_id, workflow_run_id, task_definition_id, terminal_status, failure_type, reason, final_attempt, worker_id, dead_lettered_at, created_at
+		FROM dead_letter_tasks
+		ORDER BY dead_lettered_at DESC
+		LIMIT $1 OFFSET $2
+	`
+	rows, err := r.db.QueryContext(ctx, queryDLQ, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DLQ: %w", err)
+	}
+	defer rows.Close()
+
+	var dlqs []model.DeadLetterTask
+	for rows.Next() {
+		var dlq model.DeadLetterTask
+		var reason, workerID sql.NullString
+		err := rows.Scan(
+			&dlq.ID, &dlq.TaskRunID, &dlq.WorkflowRunID, &dlq.TaskDefinitionID,
+			&dlq.TerminalStatus, &dlq.FailureType, &reason, &dlq.FinalAttempt, &workerID,
+			&dlq.DeadLetteredAt, &dlq.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan DLQ task: %w", err)
+		}
+		if reason.Valid {
+			dlq.Reason = &reason.String
+		}
+		if workerID.Valid {
+			dlq.WorkerID = &workerID.String
+		}
+		dlqs = append(dlqs, dlq)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating DLQ tasks: %w", err)
+	}
+
+	return dlqs, nil
 }

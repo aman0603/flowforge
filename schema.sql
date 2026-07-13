@@ -79,3 +79,42 @@ CREATE TABLE IF NOT EXISTS task_runs (
 
 CREATE INDEX IF NOT EXISTS idx_task_runs_status_retry ON task_runs(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_run ON task_runs(workflow_run_id);
+
+-- 6. Task Attempts
+CREATE TABLE IF NOT EXISTS task_attempts (
+    id UUID PRIMARY KEY,
+    task_run_id UUID NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    workflow_run_id UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    attempt_number INT NOT NULL,
+    worker_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    claimed_at TIMESTAMP WITH TIME ZONE,
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    output JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    failure_type VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_task_run_attempt UNIQUE (task_run_id, attempt_number),
+    CONSTRAINT chk_attempt_status CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'TIMED_OUT', 'ORPHANED')),
+    CONSTRAINT chk_attempt_number CHECK (attempt_number > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_attempts_workflow_run ON task_attempts(workflow_run_id);
+
+-- 7. Dead Letter Tasks
+CREATE TABLE IF NOT EXISTS dead_letter_tasks (
+    id UUID PRIMARY KEY,
+    task_run_id UUID NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+    workflow_run_id UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    task_definition_id UUID NOT NULL REFERENCES task_definitions(id) ON DELETE RESTRICT,
+    terminal_status VARCHAR(50) NOT NULL,
+    failure_type VARCHAR(100) NOT NULL,
+    reason TEXT,
+    final_attempt INT NOT NULL,
+    worker_id VARCHAR(255),
+    dead_lettered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_dead_letter_tasks_workflow_run ON dead_letter_tasks(workflow_run_id);

@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/aman0603/flowforge/internal/config"
@@ -38,6 +40,9 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("POST /api/v1/workflows", s.handleCreateDefinition)
 	s.router.HandleFunc("POST /runs", s.handleCreateRun)
 	s.router.HandleFunc("GET /runs/{id}", s.handleGetRunDetails)
+	s.router.HandleFunc("GET /api/v1/runs/{run_id}/history", s.handleGetWorkflowRunHistory)
+	s.router.HandleFunc("GET /api/v1/tasks/{task_run_id}/attempts", s.handleGetTaskAttempts)
+	s.router.HandleFunc("GET /api/v1/dead-letter", s.handleGetDeadLetterTasks)
 }
 
 // handleHealth responds with a JSON status OK.
@@ -161,4 +166,87 @@ func (s *Server) Start(ctx context.Context) error {
 	case err := <-errChan:
 		return err
 	}
+}
+
+// handleGetWorkflowRunHistory handles GET /api/v1/runs/{run_id}/history.
+func (s *Server) handleGetWorkflowRunHistory(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+	if runID == "" {
+		s.writeError(w, http.StatusBadRequest, "missing run id", nil)
+		return
+	}
+
+	history, err := s.repo.GetWorkflowRunHistory(r.Context(), runID)
+	if err == sql.ErrNoRows {
+		s.writeError(w, http.StatusNotFound, "workflow run not found", nil)
+		return
+	} else if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to fetch workflow history", err)
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, history)
+}
+
+// handleGetTaskAttempts handles GET /api/v1/tasks/{task_run_id}/attempts.
+func (s *Server) handleGetTaskAttempts(w http.ResponseWriter, r *http.Request) {
+	taskRunID := r.PathValue("task_run_id")
+	if taskRunID == "" {
+		s.writeError(w, http.StatusBadRequest, "missing task run id", nil)
+		return
+	}
+
+	attempts, err := s.repo.GetTaskAttempts(r.Context(), taskRunID)
+	if err == sql.ErrNoRows {
+		s.writeError(w, http.StatusNotFound, "task run not found", nil)
+		return
+	} else if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to fetch task attempts", err)
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, attempts)
+}
+
+// handleGetDeadLetterTasks handles GET /api/v1/dead-letter.
+func (s *Server) handleGetDeadLetterTasks(w http.ResponseWriter, r *http.Request) {
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+
+	limit := 50
+	if limitStr != "" {
+		parsed, err := strconv.Atoi(limitStr)
+		if err != nil || parsed < 0 {
+			s.writeError(w, http.StatusBadRequest, "invalid limit parameter", nil)
+			return
+		}
+		limit = parsed
+	}
+
+	if limit > 100 {
+		limit = 100
+	}
+
+	offset := 0
+	if offsetStr != "" {
+		parsed, err := strconv.Atoi(offsetStr)
+		if err != nil || parsed < 0 {
+			s.writeError(w, http.StatusBadRequest, "invalid offset parameter", nil)
+			return
+		}
+		offset = parsed
+	}
+
+	dlqs, err := s.repo.GetDeadLetterTasks(r.Context(), limit, offset)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to fetch dead letter tasks", err)
+		return
+	}
+
+	// Always return an empty array if nil
+	if dlqs == nil {
+		dlqs = []model.DeadLetterTask{}
+	}
+
+	s.writeJSON(w, http.StatusOK, dlqs)
 }
