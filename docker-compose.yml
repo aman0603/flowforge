@@ -18,6 +18,17 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: flowforge-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
   app:
     build:
       context: .
@@ -30,8 +41,11 @@ services:
       DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
       ENV: "development"
       SCHEMA_PATH: "schema.sql"
+      REDIS_ADDR: "redis:6379"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   worker:
@@ -41,12 +55,19 @@ services:
     command: ["./worker"]
     environment:
       DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
-      WORKER_POLL_INTERVAL: "1s"
+      WORKER_POLL_INTERVAL: "${WORKER_POLL_INTERVAL:-1s}"
       CLAIMED_STALE_TIMEOUT: "${CLAIMED_STALE_TIMEOUT:-30s}"
       RUNNING_STALE_TIMEOUT: "${RUNNING_STALE_TIMEOUT:-5m}"
       RECOVERY_INTERVAL: "${RECOVERY_INTERVAL:-30s}"
+      REDIS_ADDR: "redis:6379"
+      WORKER_HEARTBEAT_INTERVAL_MS: "${WORKER_HEARTBEAT_INTERVAL_MS:-1000}"
+      WORKER_HEARTBEAT_TTL_MS: "${WORKER_HEARTBEAT_TTL_MS:-3000}"
+      TASK_LEASE_TTL_MS: "${TASK_LEASE_TTL_MS:-5000}"
+      TASK_LEASE_RENEW_INTERVAL_MS: "${TASK_LEASE_RENEW_INTERVAL_MS:-1500}"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:

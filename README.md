@@ -2,11 +2,11 @@
 
 FlowForge is a distributed, high-performance workflow execution engine written in Go. It enables clients to register Directed Acyclic Graph (DAG) workflows and execute eligible tasks concurrently across multiple distributed worker nodes.
 
-PostgreSQL is the durable source of truth for execution states, while future phases will incorporate Redis for distributed locking and Kafka for asynchronous event delivery.
+PostgreSQL is the durable source of truth for execution states, while Redis is utilized for ephemeral liveness coordination, heartbeats, and renewable task execution leases.
 
 ---
 
-## Architecture Diagram (Current Phase 5 Status)
+## Architecture Diagram (Current Phase 8 Status)
 
 ```mermaid
 graph TD
@@ -17,6 +17,10 @@ graph TD
     DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W1[Worker 1]
     DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W2[Worker 2]
     DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W3[Worker 3]
+
+    W1 <-->|Heartbeats & Leases| Redis[(Redis)]
+    W2 <-->|Heartbeats & Leases| Redis
+    W3 <-->|Heartbeats & Leases| Redis
 
     subgraph Workers
         W1
@@ -30,11 +34,13 @@ graph TD
 ## Directory Layout
 
 * **`cmd/flowforge/`**: Entry point of the application containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/flowforge/main.go), bootstrapping the database and the HTTP server.
+* **`cmd/worker/`**: Entry point of the worker process containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/worker/main.go).
 * **`internal/api/`**: The web service layers containing [server.go](file:///home/amanpaswan/aman/flowforge/internal/api/server.go), implementing routes using Go's native HTTP muxer and handling requests/responses.
 * **`internal/config/`**: Configuration loading in [config.go](file:///home/amanpaswan/aman/flowforge/internal/config/config.go) using environment variables.
 * **`internal/dag/`**: Core graph validation logic in [dag.go](file:///home/amanpaswan/aman/flowforge/internal/dag/dag.go) to detect circular dependencies before persisting workflows.
 * **`internal/model/`**: Shared Go structs, constants, and API structures in [model.go](file:///home/amanpaswan/aman/flowforge/internal/model/model.go).
 * **`internal/repository/`**: PostgreSQL database connector and transaction boundaries implemented in [postgres.go](file:///home/amanpaswan/aman/flowforge/internal/repository/postgres.go).
+* **`internal/worker/`**: Worker process logic, execution loop, lease coordinator, and executors.
 * **`schema.sql`**: Relational database schema layout [schema.sql](file:///home/amanpaswan/aman/flowforge/schema.sql).
 
 ---
@@ -155,7 +161,7 @@ Queries the execution progress and state of all task runs for a given workflow r
 ## How to Run & Build
 
 ### Using Docker (Recommended)
-We use Docker Compose to manage PostgreSQL, the API server, and 3 workers.
+We use Docker Compose to manage PostgreSQL, Redis, the API server, and 3 workers.
 
 ```bash
 # Start all containers in the foreground with 3 concurrent workers
@@ -166,11 +172,12 @@ docker compose down -v
 ```
 
 ### Running Locally (Without Docker)
-Make sure you have a running PostgreSQL database and specify its URL via environment variables:
+Make sure you have running PostgreSQL and Redis instances, and specify configuration via environment variables:
 
 ```bash
 # Set configuration variables
 export DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"
+export REDIS_ADDR="localhost:6379"
 export PORT="8080"
 export SCHEMA_PATH="schema.sql"
 
@@ -216,38 +223,45 @@ SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE
 ```
 This forces all completion/failure transactions for the same workflow to serialize, keeping sibling completions completely safe and deterministic.
 
-### 3. Worker Ownership Fencing
-Workers acquire tasks and stamp their unique `worker_id` (generated via container hostname and UUID). All subsequent task mutations (`StartTaskRun`, `MarkTaskRunCompleted`, `MarkTaskRunFailed`) are guarded by checking:
+### 3. Worker Ownership Fencing & Monotonic Fencing Tokens
+Workers acquire tasks and stamp their unique `worker_id` (generated via container hostname and UUID). Additionally, each task claim atomically increments a monotonic `fencing_token` on the task run in PostgreSQL. All subsequent authoritative task mutations (`StartTaskRun`, `MarkTaskRunCompleted`, `MarkTaskRunFailed`) are guarded by checking:
 ```sql
-WHERE worker_id = $workerID AND status = $expectedStatus
+WHERE worker_id = $workerID AND fencing_token = $fencingToken AND status = $expectedStatus
 ```
-This prevents hijacked execution or split-brain transitions.
+This prevents hijacked execution, split-brain transitions, or late-arriving writes from stale workers.
 
-### 4. Stale Task Crash Recovery
+### 4. Ephemeral Redis Coordination & Renewable Leases
+While PostgreSQL owns the durable workflow correctness, Redis acts as the ephemeral coordination layer.
+* **Worker Liveness:** Workers register their presence via a TTL-backed heartbeat key (`flowforge:worker:{worker_id}:heartbeat`) in Redis. A background loop refreshes this heartbeat periodically. If a worker process crashes, its heartbeat key naturally expires.
+* **Task Leases:** Upon claiming a task, the worker acquires a lease key (`flowforge:task:{task_run_id}:lease`) in Redis. The worker periodically renews this lease during active execution.
+* **Context Interruption:** If a worker fails to renew its lease (due to network partition or Redis failure), it immediately cancels the executing task's context and aborts writing terminal results to PostgreSQL.
+
+### 5. Lease-Aware Stale Task Crash Recovery
 Workers run a background context-aware stale-task recovery loop.
-* **Stale CLAIMED Reset:** Tasks stuck in `CLAIMED` status longer than `CLAIMED_STALE_TIMEOUT` (default `30s`) are reset back to `READY` (clearing `worker_id` and `claimed_at`).
-* **Stale RUNNING Reset:** Tasks stuck in `RUNNING` status longer than `RUNNING_STALE_TIMEOUT` (default `5m`) are reset back to `READY` (clearing `worker_id`, `claimed_at`, `started_at`, and resetting execution-result fields to default).
+* **Stale CLAIMED Reset:** Tasks stuck in `CLAIMED` status longer than `CLAIMED_STALE_TIMEOUT` (default `30s`) are reset back to `READY` if no active lease exists or the lease owner has died.
+* **Stale RUNNING Reset:** Tasks stuck in `RUNNING` status longer than `RUNNING_STALE_TIMEOUT` (default `5m`) are reset back to `READY` (clearing `worker_id`, `claimed_at`, `started_at`, and resetting execution-result fields) if no active lease exists or the lease owner has died.
+* **Attempt Orphaning:** Stale running resets transition the corresponding active attempt record in `task_attempts` to `ORPHANED`.
 
-### 5. Automatic Retries and Exponential Backoff
+### 6. Automatic Retries and Exponential Backoff
 When task execution fails or times out, and its execution `attempts <= max_retries`, FlowForge schedules a retry:
 * The task status transitions to `RETRY_WAIT`.
 * The parent workflow run remains `RUNNING`, and all downstream child tasks remain blocked in `PENDING`.
 * Next execution time is computed using exponential backoff: `delay = base_backoff * 2^(attempts-1)`, capped at 1 hour and bounded to prevent numeric overflow.
 * Once the backoff delay has elapsed, the background recovery routine promotes the task back to `READY`.
 
-### 6. Priority-Based Scheduling Preference
+### 7. Priority-Based Scheduling Preference
 Task execution selection prioritizes tasks with higher priority values:
 * Claiming queries select `READY` tasks ordered by `priority DESC` and then `created_at ASC` (FIFO tie-breaking).
 * Priority is a scheduling preference; already CLAIMED or RUNNING tasks are not preempted.
 * Priority does not bypass DAG dependencies (downstream dependent tasks remain blocked until all parents succeed).
 
-### 7. Task Execution Timeouts
+### 8. Task Execution Timeouts
 Workers enforce execution-level context timeouts based on the task's `timeout_ms` definition:
 * A timeout triggers context cancellation (`context.DeadlineExceeded`) on the executing task.
 * On timeout, the task consumes a retry attempt and transitions to `RETRY_WAIT` (if budget remains) or to terminal `TIMED_OUT` (if retry budget is exhausted).
 * Worker process graceful shutdown cancellations (`context.Canceled`) are distinguished from task execution timeouts, leaving the task in `RUNNING` for normal stale task recovery without consuming attempts.
 
-### 8. Durable Attempt History
+### 9. Durable Attempt History
 FlowForge records details of every individual execution attempt of a task in the `task_attempts` table.
 * **Attempt Semantics:** Each `StartTaskRun` transaction atomically increments the task run's `attempts` count and inserts a corresponding `task_attempts` record with an incremented `attempt_number` and `RUNNING` status.
 * **Attempt Statuses:**
@@ -261,23 +275,23 @@ FlowForge records details of every individual execution attempt of a task in the
   * `TIMEOUT`: Set when the execution timeout is exceeded.
   * `WORKER_LOST`: Set on `ORPHANED` attempts when the worker disappears.
 
-### 9. Dead-Letter Queue (DLQ)
+### 10. Dead-Letter Queue (DLQ)
 When a task run reaches an unrecoverable terminal execution state due to retry exhaustion (normal failures or timeouts), FlowForge writes a durable record to `dead_letter_tasks` in the same transaction as the task run terminal status update.
 * **Dead-letter conditions:** Tasks are only dead-lettered when they transition to terminal `FAILED` or `TIMED_OUT` states (i.e. retry budget exhausted).
 * **Uniqueness:** A unique index on `task_run_id` prevents duplicate DLQ records.
 * **Replay Support:** Replay is not automatically supported in Phase 7; it is deferred to future design.
 
-### 10. HTTP History & Observability APIs
+### 11. HTTP History & Observability APIs
 FlowForge provides REST endpoints to inspect execution history and terminal failures:
 * `GET /api/v1/runs/{run_id}/history`: Returns the complete history of a workflow run, including all its tasks and attempts.
 * `GET /api/v1/tasks/{task_run_id}/attempts`: Returns attempts for a task run ordered by `attempt_number ASC`.
 * `GET /api/v1/dead-letter`: Returns the paginated list of dead-lettered tasks.
   * **Pagination:** Query parameters `limit` (default 50, max 100) and `offset` are validated and enforced.
 
-### 11. Delivery Semantics & Crash Windows
+### 12. Delivery Semantics & Crash Windows
 > [!IMPORTANT]
 > **FlowForge provides at-least-once execution semantics.**
-> Recovering a stale `RUNNING` task resets it back to `READY` to allow re-claiming and re-execution, and marks the failed attempt as `ORPHANED`. If a worker crashed during execution or after completing side effects but before persisting the state, the task will execute again. Therefore, task executors that perform external side effects must be designed to be idempotent.
+> Recovering a stale `RUNNING` task resets it back to `READY` to allow re-claiming and re-execution, and marks the failed attempt as `ORPHANED`. Fencing tokens prevent stale workers from committing authoritative FlowForge task results, but cannot undo an external side effect that occurred before lease loss, process failure, or stale-write rejection. Therefore, task executors that perform external side effects must be designed to be idempotent.
 
 * **Crash Windows and Duplicate Execution:**
   * *Window A (Duplicate Side Effects):* Executor completes external side effects -> Worker crashes before `COMPLETED` is persisted -> Stale recovery reclaims task and marks attempt `ORPHANED` -> Task runs again. (Idempotency required).
@@ -285,16 +299,15 @@ FlowForge provides REST endpoints to inspect execution history and terminal fail
   * *Window C (Claimed Reclamation):* Worker crashes while task is `CLAIMED` before `StartTaskRun` -> Stale recovery transitions task to `READY` -> No attempt record is created (attempts count remains unchanged).
   * *Window D (Terminal Transaction Crash):* Worker crashes mid-transaction when persisting terminal failure -> Database transaction rolls back completely (no partial terminal state or orphaned DLQ).
 
-### 12. Payload and Payload Size Limitations
+### 13. Payload and Payload Size Limitations
 * **Large Payloads:** Task output (`output` JSONB) and error messages (`error_message` text) are stored in the database. Very large payloads can result in high memory consumption and latency. Object storage integration is deferred to future phases.
 * **Unbounded History:** Attempt history and DLQ logs grow indefinitely without an automatic retention service.
 
-### 13. API Security
+### 14. API Security
 * APIs are currently unauthenticated. Production deployment requires external authentication proxies or gateways.
 
-### 14. Supported Executor Types
+### 15. Supported Executor Types
 * **`SLEEP`**: Basic executor that sleeps for the duration configured in `duration_ms`.
 
-### 15. Known Limitations
-* Crash recovery relies on static timeouts and periodic scans; leases and heartbeats are scheduled for future phases.
-
+### 16. Known Limitations
+* Object storage integration for large payloads is deferred to future phases.

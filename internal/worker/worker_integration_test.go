@@ -102,6 +102,8 @@ func TestWorkerTimeoutIntegration(t *testing.T) {
 		50*time.Millisecond,
 		50*time.Millisecond,
 		50*time.Millisecond,
+		&fakeCoordinator{},
+		0, 0, 0, 0,
 	)
 
 	// Start recovery/retry sweep loop in background
@@ -184,6 +186,8 @@ func TestWorkerShutdownDoesNotConsumeAttempts(t *testing.T) {
 		50*time.Millisecond,
 		50*time.Millisecond,
 		50*time.Millisecond,
+		&fakeCoordinator{},
+		0, 0, 0, 0,
 	)
 
 	// Start worker loop in background

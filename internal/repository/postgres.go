@@ -364,14 +364,15 @@ func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*
 		),
 		updated_task AS (
 			UPDATE task_runs
-			SET status = 'CLAIMED', worker_id = $1, claimed_at = NOW()
+			SET status = 'CLAIMED', worker_id = $1, claimed_at = NOW(), fencing_token = fencing_token + 1
 			FROM next_task
 			WHERE task_runs.id = next_task.id
 			RETURNING 
 				task_runs.id, 
 				task_runs.workflow_run_id, 
 				task_runs.task_definition_id, 
-				task_runs.input
+				task_runs.input,
+				task_runs.fencing_token
 		)
 		SELECT 
 			ut.id, 
@@ -381,7 +382,8 @@ func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*
 			td.task_type, 
 			td.config, 
 			ut.input, 
-			td.timeout_ms
+			td.timeout_ms,
+			ut.fencing_token
 		FROM updated_task ut
 		JOIN task_definitions td ON ut.task_definition_id = td.id
 	`
@@ -396,6 +398,7 @@ func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*
 		&ct.Config,
 		&ct.Input,
 		&ct.TimeoutMs,
+		&ct.FencingToken,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -411,23 +414,28 @@ func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*
 }
 
 // StartTaskRun transitions a task from CLAIMED to RUNNING inside a transaction.
-// Guards by ID, status = CLAIMED, and worker_id. It also validates that the parent
+// Guards by ID, status = CLAIMED, worker_id, and fencing_token if supplied. It also validates that the parent
 // workflow status is not terminal (is PENDING or RUNNING) in the same query.
 // Transitions workflow status from PENDING to RUNNING if applicable.
-func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerID string) error {
+func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerID string, fencingToken ...int64) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start StartTaskRun transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// 1. Transition task CLAIMED -> RUNNING (guarded by task status, worker_id, and workflow status)
-	const updateTaskQuery = `
+	var tokenCheck string
+	if len(fencingToken) > 0 {
+		tokenCheck = fmt.Sprintf("AND tr.fencing_token = %d", fencingToken[0])
+	}
+
+	updateTaskQuery := fmt.Sprintf(`
 		UPDATE task_runs tr
 		SET status = 'RUNNING', started_at = NOW(), attempts = attempts + 1
 		WHERE tr.id = $1
 		  AND tr.status = 'CLAIMED'
 		  AND tr.worker_id = $2
+		  %s
 		  AND EXISTS (
 			  SELECT 1
 			  FROM workflow_runs wr
@@ -435,7 +443,8 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 				AND wr.status IN ('PENDING', 'RUNNING')
 		  )
 		RETURNING tr.workflow_run_id, tr.attempts, tr.claimed_at
-	`
+	`, tokenCheck)
+
 	var workflowRunID string
 	var newAttempts int
 	var claimedAt sql.NullTime
@@ -448,11 +457,15 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 
 	// 1.5 Create task_attempt record
 	attemptID := newUUID()
+	var actualToken int64
+	if len(fencingToken) > 0 {
+		actualToken = fencingToken[0]
+	}
 	const insertAttemptQuery = `
-		INSERT INTO task_attempts (id, task_run_id, workflow_run_id, attempt_number, worker_id, status, claimed_at, started_at)
-		VALUES ($1, $2, $3, $4, $5, 'RUNNING', $6, NOW())
+		INSERT INTO task_attempts (id, task_run_id, workflow_run_id, attempt_number, worker_id, status, claimed_at, started_at, fencing_token)
+		VALUES ($1, $2, $3, $4, $5, 'RUNNING', $6, NOW(), $7)
 	`
-	_, err = tx.ExecContext(ctx, insertAttemptQuery, attemptID, taskRunID, workflowRunID, newAttempts, workerID, claimedAt)
+	_, err = tx.ExecContext(ctx, insertAttemptQuery, attemptID, taskRunID, workflowRunID, newAttempts, workerID, claimedAt, actualToken)
 	if err != nil {
 		return fmt.Errorf("failed to insert task attempt: %w", err)
 	}
@@ -478,7 +491,7 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 
 // MarkTaskRunCompleted transitions a task from RUNNING to COMPLETED inside a transaction.
 // It also unlocks eligible child task runs and checks if the parent workflow run has finished.
-func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string, workerID string, output json.RawMessage) error {
+func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string, workerID string, output json.RawMessage, fencingToken ...int64) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start MarkTaskRunCompleted transaction: %w", err)
@@ -506,15 +519,26 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 	}
 
 	// 3. Guarded task completion & retrieve definition ID and attempts
-	const completeTaskQuery = `
+	var tokenCheck string
+	var args []any
+	if len(fencingToken) > 0 {
+		tokenCheck = "AND fencing_token = $4"
+		args = []any{output, taskRunID, workerID, fencingToken[0]}
+	} else {
+		tokenCheck = ""
+		args = []any{output, taskRunID, workerID}
+	}
+
+	completeTaskQuery := fmt.Sprintf(`
 		UPDATE task_runs
 		SET status = 'COMPLETED', output = $1, error_message = NULL, completed_at = NOW()
-		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3
+		WHERE id = $2 AND status = 'RUNNING' AND worker_id = $3 %s
 		RETURNING task_definition_id, attempts
-	`
+	`, tokenCheck)
+
 	var taskDefID string
 	var attempts int
-	err = tx.QueryRowContext(ctx, completeTaskQuery, output, taskRunID, workerID).Scan(&taskDefID, &attempts)
+	err = tx.QueryRowContext(ctx, completeTaskQuery, args...).Scan(&taskDefID, &attempts)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
@@ -608,7 +632,7 @@ func calculateBackoff(baseBackoffMs int, attempts int) time.Duration {
 
 // MarkTaskRunFailed transitions a task from RUNNING to FAILED (or RETRY_WAIT, or TIMED_OUT) inside a transaction.
 // Atomically marks the parent workflow run as FAILED if retry budget is exhausted.
-func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error {
+func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool, fencingToken ...int64) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start MarkTaskRunFailed transaction: %w", err)
@@ -620,21 +644,26 @@ func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, wo
 	var attempts, maxRetries, retryBackoff int
 	var currentStatus string
 	var currentWorkerID sql.NullString
+	var currentFencingToken int64
 	const selectTaskInfo = `
-		SELECT tr.workflow_run_id, tr.attempts, td.max_retries, td.retry_backoff_ms, tr.status, tr.worker_id
+		SELECT tr.workflow_run_id, tr.attempts, td.max_retries, td.retry_backoff_ms, tr.status, tr.worker_id, tr.fencing_token
 		FROM task_runs tr
 		JOIN task_definitions td ON tr.task_definition_id = td.id
 		WHERE tr.id = $1
 	`
-	err = tx.QueryRowContext(ctx, selectTaskInfo, taskRunID).Scan(&workflowRunID, &attempts, &maxRetries, &retryBackoff, &currentStatus, &currentWorkerID)
+	err = tx.QueryRowContext(ctx, selectTaskInfo, taskRunID).Scan(&workflowRunID, &attempts, &maxRetries, &retryBackoff, &currentStatus, &currentWorkerID, &currentFencingToken)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
 		return fmt.Errorf("failed to read task info for failure: %w", err)
 	}
 
-	// Ownership and state validation
+	// Ownership and state validation including fencing token
 	if currentStatus != "RUNNING" || !currentWorkerID.Valid || currentWorkerID.String != workerID {
+		return ErrInvalidTaskTransition
+	}
+
+	if len(fencingToken) > 0 && currentFencingToken != fencingToken[0] {
 		return ErrInvalidTaskTransition
 	}
 
@@ -1072,4 +1101,104 @@ func (r *Repository) GetDeadLetterTasks(ctx context.Context, limit, offset int) 
 	}
 
 	return dlqs, nil
+}
+
+// GetActiveTaskRuns returns all task runs in CLAIMED or RUNNING status that belong to active workflows.
+func (r *Repository) GetActiveTaskRuns(ctx context.Context) ([]*model.TaskRun, error) {
+	const query = `
+		SELECT tr.id, tr.workflow_run_id, tr.task_definition_id, tr.status, tr.attempts, tr.worker_id, tr.claimed_at, tr.started_at, tr.fencing_token
+		FROM task_runs tr
+		JOIN workflow_runs wr ON tr.workflow_run_id = wr.id
+		WHERE tr.status IN ('CLAIMED', 'RUNNING')
+		  AND wr.status IN ('PENDING', 'RUNNING')
+	`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active task runs: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*model.TaskRun
+	for rows.Next() {
+		var tr model.TaskRun
+		var workerID sql.NullString
+		var claimedAt, startedAt sql.NullTime
+		err := rows.Scan(
+			&tr.ID, &tr.WorkflowRunID, &tr.TaskDefinitionID, &tr.Status,
+			&tr.Attempts, &workerID, &claimedAt, &startedAt, &tr.FencingToken,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan active task run: %w", err)
+		}
+		if workerID.Valid {
+			tr.WorkerID = &workerID.String
+		}
+		if claimedAt.Valid {
+			tr.ClaimedAt = &claimedAt.Time
+		}
+		if startedAt.Valid {
+			tr.StartedAt = &startedAt.Time
+		}
+		list = append(list, &tr)
+	}
+	return list, nil
+}
+
+// RecoverRunningTask resets a RUNNING task run back to READY, increments attempts, and marks attempt as ORPHANED.
+func (r *Repository) RecoverRunningTask(ctx context.Context, taskRunID string, fencingToken int64) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to start RecoverRunningTask transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Guard by status = 'RUNNING' and fencing_token
+	const updateQuery = `
+		UPDATE task_runs
+		SET status = 'READY',
+			worker_id = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			output = '{}'::jsonb,
+			error_message = NULL,
+			completed_at = NULL
+		WHERE id = $1 AND status = 'RUNNING' AND fencing_token = $2
+	`
+	res, err := tx.ExecContext(ctx, updateQuery, taskRunID, fencingToken)
+	if err != nil {
+		return false, fmt.Errorf("failed to update running task to READY: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil || rows == 0 {
+		return false, err
+	}
+
+	const orphanQuery = `
+		UPDATE task_attempts
+		SET status = 'ORPHANED', completed_at = NOW(), failure_type = 'WORKER_LOST', error_message = 'worker execution became stale'
+		WHERE task_run_id = $1 AND status = 'RUNNING'
+	`
+	_, err = tx.ExecContext(ctx, orphanQuery, taskRunID)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark attempt as ORPHANED: %w", err)
+	}
+
+	return true, tx.Commit()
+}
+
+// RecoverClaimedTask resets a CLAIMED task run back to READY.
+func (r *Repository) RecoverClaimedTask(ctx context.Context, taskRunID string, fencingToken int64) (bool, error) {
+	const updateQuery = `
+		UPDATE task_runs
+		SET status = 'READY',
+			worker_id = NULL,
+			claimed_at = NULL
+		WHERE id = $1 AND status = 'CLAIMED' AND fencing_token = $2
+	`
+	res, err := r.db.ExecContext(ctx, updateQuery, taskRunID, fencingToken)
+	if err != nil {
+		return false, fmt.Errorf("failed to update claimed task to READY: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	return rows > 0, nil
 }

@@ -1783,3 +1783,134 @@ func TestDLQIntegration(t *testing.T) {
 			taskRunID, terminalStatus, failureType, reason, finalAttempt, workerID)
 	}
 }
+
+func TestFencingTokensAndRecovery(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestDB(t)
+
+	// 1. Create a definition & run
+	req := model.CreateDefinitionRequest{
+		Name:        "fencing-workflow",
+		Description: "test fencing and recovery",
+		Tasks: []model.TaskDefinitionInput{
+			{
+				Name:           "TaskA",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				RetryBackoffMs: 100,
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+		},
+	}
+	def, err := repo.CreateWorkflowDefinition(ctx, &req)
+	if err != nil {
+		t.Fatalf("failed to create workflow def: %v", err)
+	}
+	run, _ := repo.CreateWorkflowRun(ctx, def.ID, nil)
+
+	// 2. Claim READY task -> fencing token must be 1
+	claimed1, err := repo.ClaimNextReadyTask(ctx, "worker-1")
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if claimed1.FencingToken != 1 {
+		t.Errorf("expected fencing token 1 on first claim, got %d", claimed1.FencingToken)
+	}
+
+	// Verify active task runs can be fetched
+	activeRuns, err := repo.GetActiveTaskRuns(ctx)
+	if err != nil || len(activeRuns) != 1 {
+		t.Fatalf("expected 1 active run, got %d, err=%v", len(activeRuns), err)
+	}
+	if activeRuns[0].ID != claimed1.TaskRunID || activeRuns[0].FencingToken != 1 {
+		t.Errorf("unexpected active run properties: id=%s, token=%d", activeRuns[0].ID, activeRuns[0].FencingToken)
+	}
+
+	// 3. Stale CLAIMED recovery resets it back to READY
+	recovered, err := repo.RecoverClaimedTask(ctx, claimed1.TaskRunID, claimed1.FencingToken)
+	if err != nil || !recovered {
+		t.Fatalf("failed to recover claimed task: %v", err)
+	}
+
+	// 4. Re-claim task -> fencing token must be 2
+	claimed2, err := repo.ClaimNextReadyTask(ctx, "worker-2")
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if claimed2.FencingToken != 2 {
+		t.Errorf("expected fencing token 2 on reclaim, got %d", claimed2.FencingToken)
+	}
+
+	// 5. Worker 1 (old claim, token 1) tries to start -> must be rejected
+	err = repo.StartTaskRun(ctx, claimed1.TaskRunID, "worker-1", claimed1.FencingToken)
+	if !errors.Is(err, ErrInvalidTaskTransition) {
+		t.Errorf("expected ErrInvalidTaskTransition when old worker tries to start task, got %v", err)
+	}
+
+	// 6. Worker 2 (current claim, token 2) starts successfully
+	err = repo.StartTaskRun(ctx, claimed2.TaskRunID, "worker-2", claimed2.FencingToken)
+	if err != nil {
+		t.Fatalf("expected successful StartTaskRun for current worker, got %v", err)
+	}
+
+	// 7. Worker 1 tries to mark completed with token 1 -> must be rejected
+	err = repo.MarkTaskRunCompleted(ctx, claimed2.TaskRunID, "worker-1", json.RawMessage(`{}`), claimed1.FencingToken)
+	if !errors.Is(err, ErrInvalidTaskTransition) {
+		t.Errorf("expected ErrInvalidTaskTransition on stale complete, got %v", err)
+	}
+
+	// 8. Worker 1 tries to mark failed with token 1 -> must be rejected
+	err = repo.MarkTaskRunFailed(ctx, claimed2.TaskRunID, "worker-1", "stale error", false, claimed1.FencingToken)
+	if !errors.Is(err, ErrInvalidTaskTransition) {
+		t.Errorf("expected ErrInvalidTaskTransition on stale fail, got %v", err)
+	}
+
+	// 9. Recover running task -> increments fencing token check is bypassed
+	recovered, err = repo.RecoverRunningTask(ctx, claimed2.TaskRunID, claimed2.FencingToken)
+	if err != nil || !recovered {
+		t.Fatalf("failed to recover running task: %v", err)
+	}
+
+	// Verify task run is now back to READY
+	var status string
+	_ = repo.db.QueryRowContext(ctx, "SELECT status FROM task_runs WHERE id = $1", claimed2.TaskRunID).Scan(&status)
+	if status != "READY" {
+		t.Errorf("expected recovered task status to be READY, got %s", status)
+	}
+
+	// Verify attempt history has an ORPHANED attempt
+	var attemptStatus string
+	_ = repo.db.QueryRowContext(ctx, "SELECT status FROM task_attempts WHERE task_run_id = $1 AND attempt_number = 1", claimed2.TaskRunID).Scan(&attemptStatus)
+	if attemptStatus != "ORPHANED" {
+		t.Errorf("expected attempt 1 status to be ORPHANED, got %s", attemptStatus)
+	}
+
+	// 10. Re-claim task -> fencing token must be 3
+	claimed3, err := repo.ClaimNextReadyTask(ctx, "worker-3")
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if claimed3.FencingToken != 3 {
+		t.Errorf("expected fencing token 3 on reclaim after running recovery, got %d", claimed3.FencingToken)
+	}
+
+	// 11. Worker 3 starts and completes successfully with token 3
+	err = repo.StartTaskRun(ctx, claimed3.TaskRunID, "worker-3", claimed3.FencingToken)
+	if err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+	err = repo.MarkTaskRunCompleted(ctx, claimed3.TaskRunID, "worker-3", json.RawMessage(`{"res":"ok"}`), claimed3.FencingToken)
+	if err != nil {
+		t.Fatalf("failed to complete: %v", err)
+	}
+
+	// Verify workflow completes
+	var runStatus string
+	_ = repo.db.QueryRowContext(ctx, "SELECT status FROM workflow_runs WHERE id = $1", run.ID).Scan(&runStatus)
+	if runStatus != "COMPLETED" {
+		t.Errorf("expected workflow to be COMPLETED, got %s", runStatus)
+	}
+}
+

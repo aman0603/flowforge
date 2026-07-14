@@ -67,7 +67,14 @@ func main() {
 		}
 	}
 
-	// 5. Register Executors
+	// 5. Connect to Redis Coordination
+	coord, err := worker.NewRedisCoordinator(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	if err != nil {
+		log.Fatalf("[worker-%s] Failed to connect to Redis coordination: %v", workerID, err)
+	}
+	defer coord.Close()
+
+	// 5.5 Register Executors
 	executors := map[string]worker.Executor{
 		"SLEEP": worker.NewSleepExecutor(),
 	}
@@ -81,6 +88,11 @@ func main() {
 		claimedStaleTimeout,
 		runningStaleTimeout,
 		recoveryInterval,
+		coord,
+		cfg.WorkerHeartbeatInterval,
+		cfg.WorkerHeartbeatTTL,
+		cfg.TaskLeaseTTL,
+		cfg.TaskLeaseRenewInterval,
 	)
 
 	// 6. Signal-aware context for Graceful Shutdown

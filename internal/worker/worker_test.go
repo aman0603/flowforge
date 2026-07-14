@@ -15,9 +15,9 @@ import (
 type fakeRepository struct {
 	mu             sync.Mutex
 	claimFunc      func(ctx context.Context, workerID string) (*model.ClaimedTask, error)
-	startFunc      func(ctx context.Context, taskRunID string, workerID string) error
-	completeFunc   func(ctx context.Context, taskRunID string, workerID string, output json.RawMessage) error
-	failFunc       func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error
+	startFunc      func(ctx context.Context, taskRunID string, workerID string, fencingToken ...int64) error
+	completeFunc   func(ctx context.Context, taskRunID string, workerID string, output json.RawMessage, fencingToken ...int64) error
+	failFunc       func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool, fencingToken ...int64) error
 	startedCalls   int
 	completedCalls int
 	failedCalls    int
@@ -32,42 +32,192 @@ func (f *fakeRepository) ClaimNextReadyTask(ctx context.Context, workerID string
 	return nil, nil
 }
 
-func (f *fakeRepository) StartTaskRun(ctx context.Context, taskRunID string, workerID string) error {
+func (f *fakeRepository) StartTaskRun(ctx context.Context, taskRunID string, workerID string, fencingToken ...int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startedCalls++
 	if f.startFunc != nil {
-		return f.startFunc(ctx, taskRunID, workerID)
+		return f.startFunc(ctx, taskRunID, workerID, fencingToken...)
 	}
 	return nil
 }
 
-func (f *fakeRepository) MarkTaskRunCompleted(ctx context.Context, taskRunID string, workerID string, output json.RawMessage) error {
+func (f *fakeRepository) MarkTaskRunCompleted(ctx context.Context, taskRunID string, workerID string, output json.RawMessage, fencingToken ...int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completedCalls++
 	if f.completeFunc != nil {
-		return f.completeFunc(ctx, taskRunID, workerID, output)
+		return f.completeFunc(ctx, taskRunID, workerID, output, fencingToken...)
 	}
 	return nil
 }
 
-func (f *fakeRepository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error {
+func (f *fakeRepository) MarkTaskRunFailed(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool, fencingToken ...int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failedCalls++
 	if f.failFunc != nil {
-		return f.failFunc(ctx, taskRunID, workerID, errMsg, isTimeout)
+		return f.failFunc(ctx, taskRunID, workerID, errMsg, isTimeout, fencingToken...)
 	}
 	return nil
 }
 
-func (f *fakeRepository) RecoverStaleTasks(ctx context.Context, claimedTimeout time.Duration, runningTimeout time.Duration) (model.RecoveryResult, error) {
-	return model.RecoveryResult{}, nil
+func (f *fakeRepository) GetActiveTaskRuns(ctx context.Context) ([]*model.TaskRun, error) {
+	return nil, nil
+}
+
+func (f *fakeRepository) RecoverRunningTask(ctx context.Context, taskRunID string, fencingToken int64) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeRepository) RecoverClaimedTask(ctx context.Context, taskRunID string, fencingToken int64) (bool, error) {
+	return true, nil
 }
 
 func (f *fakeRepository) PromoteDueRetries(ctx context.Context) (int64, error) {
 	return 0, nil
+}
+
+type fakeLease struct {
+	workerID     string
+	fencingToken int64
+}
+
+type fakeCoordinator struct {
+	registerFunc     func(ctx context.Context, workerID string, ttl time.Duration) error
+	deregisterFunc   func(ctx context.Context, workerID string) error
+	heartbeatFunc    func(ctx context.Context, workerID string, ttl time.Duration) error
+	isAliveFunc      func(ctx context.Context, workerID string) (bool, error)
+	acquireLeaseFunc func(ctx context.Context, taskRunID string, workerID string, fencingToken int64, ttl time.Duration) (bool, error)
+	renewLeaseFunc   func(ctx context.Context, taskRunID string, workerID string, fencingToken int64, ttl time.Duration) (bool, error)
+	releaseLeaseFunc func(ctx context.Context, taskRunID string, workerID string, fencingToken int64) error
+	getLeaseFunc     func(ctx context.Context, taskRunID string) (string, int64, error)
+
+	mu           sync.Mutex
+	leases       map[string]fakeLease
+	aliveWorkers map[string]bool
+}
+
+func (f *fakeCoordinator) RegisterWorker(ctx context.Context, workerID string, ttl time.Duration) error {
+	if f.registerFunc != nil {
+		return f.registerFunc(ctx, workerID, ttl)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aliveWorkers == nil {
+		f.aliveWorkers = make(map[string]bool)
+	}
+	f.aliveWorkers[workerID] = true
+	return nil
+}
+
+func (f *fakeCoordinator) DeregisterWorker(ctx context.Context, workerID string) error {
+	if f.deregisterFunc != nil {
+		return f.deregisterFunc(ctx, workerID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aliveWorkers != nil {
+		delete(f.aliveWorkers, workerID)
+	}
+	return nil
+}
+
+func (f *fakeCoordinator) HeartbeatWorker(ctx context.Context, workerID string, ttl time.Duration) error {
+	if f.heartbeatFunc != nil {
+		return f.heartbeatFunc(ctx, workerID, ttl)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aliveWorkers == nil {
+		f.aliveWorkers = make(map[string]bool)
+	}
+	f.aliveWorkers[workerID] = true
+	return nil
+}
+
+func (f *fakeCoordinator) IsWorkerAlive(ctx context.Context, workerID string) (bool, error) {
+	if f.isAliveFunc != nil {
+		return f.isAliveFunc(ctx, workerID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aliveWorkers == nil {
+		return true, nil
+	}
+	alive, exists := f.aliveWorkers[workerID]
+	if !exists {
+		return true, nil // default to true if never registered to prevent false positives in simple unit tests
+	}
+	return alive, nil
+}
+
+func (f *fakeCoordinator) AcquireTaskLease(ctx context.Context, taskRunID string, workerID string, fencingToken int64, ttl time.Duration) (bool, error) {
+	if f.acquireLeaseFunc != nil {
+		return f.acquireLeaseFunc(ctx, taskRunID, workerID, fencingToken, ttl)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leases == nil {
+		f.leases = make(map[string]fakeLease)
+	}
+	f.leases[taskRunID] = fakeLease{workerID: workerID, fencingToken: fencingToken}
+	return true, nil
+}
+
+func (f *fakeCoordinator) RenewTaskLease(ctx context.Context, taskRunID string, workerID string, fencingToken int64, ttl time.Duration) (bool, error) {
+	if f.renewLeaseFunc != nil {
+		return f.renewLeaseFunc(ctx, taskRunID, workerID, fencingToken, ttl)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leases == nil {
+		return false, nil
+	}
+	lease, exists := f.leases[taskRunID]
+	if !exists || lease.workerID != workerID || lease.fencingToken != fencingToken {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (f *fakeCoordinator) ReleaseTaskLease(ctx context.Context, taskRunID string, workerID string, fencingToken int64) error {
+	if f.releaseLeaseFunc != nil {
+		return f.releaseLeaseFunc(ctx, taskRunID, workerID, fencingToken)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leases != nil {
+		lease, exists := f.leases[taskRunID]
+		if exists && lease.workerID == workerID && lease.fencingToken == fencingToken {
+			delete(f.leases, taskRunID)
+		}
+	}
+	return nil
+}
+
+func (f *fakeCoordinator) GetTaskLease(ctx context.Context, taskRunID string) (string, int64, error) {
+	if f.getLeaseFunc != nil {
+		return f.getLeaseFunc(ctx, taskRunID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leases == nil {
+		return "", 0, nil
+	}
+	lease, exists := f.leases[taskRunID]
+	if !exists {
+		return "", 0, nil
+	}
+	return lease.workerID, lease.fencingToken, nil
+}
+
+func (f *fakeCoordinator) Close() error {
+	return nil
+}
+
+func newTestWorker(id string, repo Repository, executors map[string]Executor, pollInterval time.Duration) *Worker {
+	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0)
 }
 
 type fakeExecutor struct {
@@ -87,7 +237,7 @@ func TestWorkerOrchestration(t *testing.T) {
 		executors := map[string]Executor{
 			"SLEEP": &fakeExecutor{},
 		}
-		w := New("test-worker", repo, executors, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, executors, 1*time.Millisecond)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
@@ -129,7 +279,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 
 		// Cancel context in a background routine after processing starts
@@ -178,7 +328,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -216,7 +366,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{}, 1*time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -249,12 +399,12 @@ func TestWorkerOrchestration(t *testing.T) {
 				}
 				return nil, nil
 			},
-			startFunc: func(ctx context.Context, taskRunID string, workerID string) error {
+			startFunc: func(ctx context.Context, taskRunID string, workerID string, fencingToken ...int64) error {
 				return repository.ErrInvalidTaskTransition
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -295,7 +445,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			},
 		}
 
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
 		err := w.Run(ctx)
 		if err != nil {
 			t.Fatalf("expected nil error on shutdown, got: %v", err)
@@ -317,7 +467,7 @@ func TestWorkerOrchestration(t *testing.T) {
 				return nil, errors.New("infrastructure database failure")
 			},
 		}
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond)
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on claim DB error, got nil")
@@ -333,11 +483,11 @@ func TestWorkerOrchestration(t *testing.T) {
 			claimFunc: func(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
 				return claimedTask, nil
 			},
-			completeFunc: func(ctx context.Context, taskRunID string, workerID string, output json.RawMessage) error {
+			completeFunc: func(ctx context.Context, taskRunID string, workerID string, output json.RawMessage, fencingToken ...int64) error {
 				return errors.New("completion persistence failure")
 			},
 		}
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": &fakeExecutor{}}, 1*time.Millisecond)
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on completion DB failure, got nil")
@@ -353,7 +503,7 @@ func TestWorkerOrchestration(t *testing.T) {
 			claimFunc: func(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
 				return claimedTask, nil
 			},
-			failFunc: func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool) error {
+			failFunc: func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool, fencingToken ...int64) error {
 				return errors.New("failure persistence failure")
 			},
 		}
@@ -362,7 +512,7 @@ func TestWorkerOrchestration(t *testing.T) {
 				return nil, errors.New("execution error")
 			},
 		}
-		w := New("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond, 0, 0, 0)
+		w := newTestWorker("test-worker", repo, map[string]Executor{"SLEEP": exec}, 1*time.Millisecond)
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on failure DB failure, got nil")

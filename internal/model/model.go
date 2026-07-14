@@ -101,6 +101,7 @@ type TaskRun struct {
 	ClaimedAt        *time.Time      `json:"claimed_at,omitempty"`
 	StartedAt        *time.Time      `json:"started_at,omitempty"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
+	FencingToken     int64           `json:"fencing_token"`
 	CreatedAt        time.Time       `json:"created_at"`
 }
 
@@ -145,6 +146,7 @@ type ClaimedTask struct {
 	Config           json.RawMessage `json:"config"`
 	Input            json.RawMessage `json:"input"`
 	TimeoutMs        int             `json:"timeout_ms"`
+	FencingToken     int64           `json:"fencing_token"`
 }
 
 // RecoveryResult represents the outcome of a stale task recovery operation.
@@ -168,6 +170,7 @@ type TaskAttempt struct {
 	Output        json.RawMessage `json:"output"`
 	ErrorMessage  *string         `json:"error_message,omitempty"`
 	FailureType   *string         `json:"failure_type,omitempty"`
+	FencingToken  int64           `json:"fencing_token"`
 	CreatedAt     time.Time       `json:"created_at"`
 }
 
