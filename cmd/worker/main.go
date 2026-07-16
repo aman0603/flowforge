@@ -93,6 +93,10 @@ func main() {
 		cfg.WorkerHeartbeatTTL,
 		cfg.TaskLeaseTTL,
 		cfg.TaskLeaseRenewInterval,
+		cfg.WorkerPoolSize,
+		cfg.WorkerQueueCapacity,
+		cfg.WorkerClaimBatchSize,
+		cfg.WorkerShutdownGrace,
 	)
 
 	// 6. Signal-aware context for Graceful Shutdown

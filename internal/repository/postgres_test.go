@@ -1914,3 +1914,148 @@ func TestFencingTokensAndRecovery(t *testing.T) {
 	}
 }
 
+func TestBatchClaiming(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestDB(t)
+
+	// Create workflow definition with tasks of different priorities and dependencies
+	req := model.CreateDefinitionRequest{
+		Name:        "batch-workflow",
+		Description: "testing batch claiming",
+		Tasks: []model.TaskDefinitionInput{
+			{
+				Name:           "TaskA",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				Priority:       10, // high priority
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+			{
+				Name:           "TaskB",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				Priority:       20, // highest priority
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+			{
+				Name:           "TaskC",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				Priority:       5, // low priority
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+			{
+				Name:           "TaskD",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				Priority:       10, // high priority (to test FIFO tie-breaker with TaskA)
+				TimeoutMs:      5000,
+				Dependencies:   []string{},
+			},
+			{
+				Name:           "TaskE",
+				TaskType:       "SLEEP",
+				Config:         json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:     1,
+				Priority:       100, // blocked priority
+				TimeoutMs:      5000,
+				Dependencies:   []string{"TaskB"},
+			},
+		},
+	}
+
+	def, err := repo.CreateWorkflowDefinition(ctx, &req)
+	if err != nil {
+		t.Fatalf("failed to create definition: %v", err)
+	}
+
+	// Create run
+	_, err = repo.CreateWorkflowRun(ctx, def.ID, nil)
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	// Update created_at of TaskA to be older than TaskD
+	_, err = repo.db.ExecContext(ctx, "UPDATE task_runs SET created_at = NOW() - INTERVAL '10 seconds' WHERE id IN (SELECT tr.id FROM task_runs tr JOIN task_definitions td ON tr.task_definition_id = td.id WHERE td.name = 'TaskA')")
+	if err != nil {
+		t.Fatalf("failed to update TaskA created_at: %v", err)
+	}
+	_, err = repo.db.ExecContext(ctx, "UPDATE task_runs SET created_at = NOW() - INTERVAL '5 seconds' WHERE id IN (SELECT tr.id FROM task_runs tr JOIN task_definitions td ON tr.task_definition_id = td.id WHERE td.name = 'TaskD')")
+	if err != nil {
+		t.Fatalf("failed to update TaskD created_at: %v", err)
+	}
+
+	// 1. Claim batch with invalid limit <= 0 -> returns nil
+	tasks, err := repo.ClaimReadyTasksBatch(ctx, "worker-1", 0)
+	if err != nil || len(tasks) != 0 {
+		t.Errorf("expected nil/empty for limit 0, got tasks=%v, err=%v", tasks, err)
+	}
+
+	// 2. Claim batch of 2 tasks
+	// Eligible ready tasks: TaskB (priority 20), TaskA (priority 10), TaskD (priority 10), TaskC (priority 5).
+	// TaskE is blocked because TaskB is not completed.
+	// TaskA was defined/created before TaskD, so TaskA should be claimed before TaskD (FIFO tie-breaker).
+	// Therefore, batch size 2 should claim TaskB and TaskA!
+	batch1, err := repo.ClaimReadyTasksBatch(ctx, "worker-1", 2)
+	if err != nil {
+		t.Fatalf("failed to claim batch 1: %v", err)
+	}
+
+	if len(batch1) != 2 {
+		t.Fatalf("expected 2 tasks claimed, got %d", len(batch1))
+	}
+
+	if batch1[0].Name != "TaskB" || batch1[1].Name != "TaskA" {
+		t.Errorf("expected TaskB and TaskA to be claimed in order, got %s and %s", batch1[0].Name, batch1[1].Name)
+	}
+
+	// Verify fencing tokens are both 1 (since it's their first claim)
+	if batch1[0].FencingToken != 1 || batch1[1].FencingToken != 1 {
+		t.Errorf("expected fencing token 1 for first claims, got %d and %d", batch1[0].FencingToken, batch1[1].FencingToken)
+	}
+
+	// 3. Claim remaining ready tasks with batch size 10 (which is larger than remaining ready count)
+	// Remaining: TaskD (priority 10), TaskC (priority 5).
+	batch2, err := repo.ClaimReadyTasksBatch(ctx, "worker-1", 10)
+	if err != nil {
+		t.Fatalf("failed to claim batch 2: %v", err)
+	}
+
+	if len(batch2) != 2 {
+		t.Fatalf("expected 2 tasks claimed in batch 2, got %d", len(batch2))
+	}
+
+	if batch2[0].Name != "TaskD" || batch2[1].Name != "TaskC" {
+		t.Errorf("expected TaskD and TaskC to be claimed in order, got %s and %s", batch2[0].Name, batch2[1].Name)
+	}
+
+	// 4. Stale claimed task recovery check
+	// Bypassing active lease to recover TaskB (first task in batch1)
+	recovered, err := repo.RecoverClaimedTask(ctx, batch1[0].TaskRunID, batch1[0].FencingToken)
+	if err != nil || !recovered {
+		t.Fatalf("failed to recover claimed TaskB: %v", err)
+	}
+
+	// Re-claim TaskB. Fencing token should increment to 2.
+	batch3, err := repo.ClaimReadyTasksBatch(ctx, "worker-2", 1)
+	if err != nil {
+		t.Fatalf("failed to claim batch 3: %v", err)
+	}
+
+	if len(batch3) != 1 || batch3[0].Name != "TaskB" {
+		t.Fatalf("expected TaskB to be reclaimed, got batch: %v", batch3)
+	}
+
+	if batch3[0].FencingToken != 2 {
+		t.Errorf("expected fencing token 2 on reclaim, got %d", batch3[0].FencingToken)
+	}
+}
+
+

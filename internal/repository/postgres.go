@@ -343,30 +343,34 @@ func (r *Repository) GetWorkflowRunDetails(ctx context.Context, runID string) (*
 	}, nil
 }
 
-// ClaimNextReadyTask atomically claims the oldest READY task and updates it to CLAIMED,
-// returning the combined execution details. Returns (nil, nil) if no READY tasks are found.
-func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
+// ClaimReadyTasksBatch atomically claims up to limit READY tasks and updates them to CLAIMED,
+// returning the combined execution details. Returns nil or empty list if no READY tasks are found.
+func (r *Repository) ClaimReadyTasksBatch(ctx context.Context, workerID string, limit int) ([]*model.ClaimedTask, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start claim transaction: %w", err)
+		return nil, fmt.Errorf("failed to start batch claim transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	const claimQuery = `
-		WITH next_task AS (
+	const claimBatchQuery = `
+		WITH next_tasks AS (
 			SELECT tr.id 
 			FROM task_runs tr
 			JOIN task_definitions td ON tr.task_definition_id = td.id
 			WHERE tr.status = 'READY'
 			ORDER BY td.priority DESC, tr.created_at ASC
-			LIMIT 1
+			LIMIT $2
 			FOR UPDATE OF tr SKIP LOCKED
 		),
-		updated_task AS (
+		updated_tasks AS (
 			UPDATE task_runs
 			SET status = 'CLAIMED', worker_id = $1, claimed_at = NOW(), fencing_token = fencing_token + 1
-			FROM next_task
-			WHERE task_runs.id = next_task.id
+			FROM next_tasks
+			WHERE task_runs.id = next_tasks.id
 			RETURNING 
 				task_runs.id, 
 				task_runs.workflow_run_id, 
@@ -384,33 +388,63 @@ func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*
 			ut.input, 
 			td.timeout_ms,
 			ut.fencing_token
-		FROM updated_task ut
+		FROM updated_tasks ut
 		JOIN task_definitions td ON ut.task_definition_id = td.id
+		ORDER BY td.priority DESC, ut.id ASC
 	`
 
-	var ct model.ClaimedTask
-	err = tx.QueryRowContext(ctx, claimQuery, workerID).Scan(
-		&ct.TaskRunID,
-		&ct.WorkflowRunID,
-		&ct.TaskDefinitionID,
-		&ct.Name,
-		&ct.TaskType,
-		&ct.Config,
-		&ct.Input,
-		&ct.TimeoutMs,
-		&ct.FencingToken,
-	)
-	if err == sql.ErrNoRows {
+	rows, err := tx.QueryContext(ctx, claimBatchQuery, workerID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query batch claim: %w", err)
+	}
+	defer rows.Close()
+
+	var claimedTasks []*model.ClaimedTask
+	for rows.Next() {
+		var ct model.ClaimedTask
+		err = rows.Scan(
+			&ct.TaskRunID,
+			&ct.WorkflowRunID,
+			&ct.TaskDefinitionID,
+			&ct.Name,
+			&ct.TaskType,
+			&ct.Config,
+			&ct.Input,
+			&ct.TimeoutMs,
+			&ct.FencingToken,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan batch claimed task: %w", err)
+		}
+		claimedTasks = append(claimedTasks, &ct)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during batch claim rows iteration: %w", err)
+	}
+
+	if len(claimedTasks) == 0 {
 		return nil, nil
-	} else if err != nil {
-		return nil, fmt.Errorf("failed to claim task run: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit claim transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit batch claim transaction: %w", err)
 	}
 
-	return &ct, nil
+	return claimedTasks, nil
+}
+
+// ClaimNextReadyTask atomically claims the oldest READY task and updates it to CLAIMED,
+// returning the combined execution details. Returns (nil, nil) if no READY tasks are found.
+func (r *Repository) ClaimNextReadyTask(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
+	tasks, err := r.ClaimReadyTasksBatch(ctx, workerID, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+	return tasks[0], nil
 }
 
 // StartTaskRun transitions a task from CLAIMED to RUNNING inside a transaction.

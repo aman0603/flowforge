@@ -19,6 +19,10 @@ type Config struct {
 	WorkerHeartbeatTTL      time.Duration
 	TaskLeaseTTL            time.Duration
 	TaskLeaseRenewInterval  time.Duration
+	WorkerPoolSize          int
+	WorkerQueueCapacity     int
+	WorkerClaimBatchSize    int
+	WorkerShutdownGrace     time.Duration
 }
 
 // Load reads configuration from environment variables with fallback defaults.
@@ -30,11 +34,25 @@ func Load() *Config {
 	leaseTTLMs, _ := strconv.Atoi(getEnv("TASK_LEASE_TTL_MS", "5000"))
 	leaseRenewMs, _ := strconv.Atoi(getEnv("TASK_LEASE_RENEW_INTERVAL_MS", "1500"))
 
+	poolSize, _ := strconv.Atoi(getEnv("WORKER_POOL_SIZE", "16"))
+	queueCapacity, _ := strconv.Atoi(getEnv("WORKER_QUEUE_CAPACITY", "32"))
+	batchSize, _ := strconv.Atoi(getEnv("WORKER_CLAIM_BATCH_SIZE", "8"))
+	graceMs, _ := strconv.Atoi(getEnv("WORKER_SHUTDOWN_GRACE_PERIOD_MS", "10000"))
+
 	if hbIntervalMs >= hbTTLMs {
 		panic("invalid configuration: heartbeat interval must be less than heartbeat TTL")
 	}
 	if leaseRenewMs >= leaseTTLMs {
 		panic("invalid configuration: lease renewal interval must be less than lease TTL")
+	}
+	if poolSize <= 0 {
+		panic("invalid configuration: WORKER_POOL_SIZE must be greater than 0")
+	}
+	if queueCapacity < poolSize {
+		panic("invalid configuration: WORKER_QUEUE_CAPACITY must be greater than or equal to WORKER_POOL_SIZE")
+	}
+	if batchSize <= 0 {
+		panic("invalid configuration: WORKER_CLAIM_BATCH_SIZE must be greater than 0")
 	}
 
 	return &Config{
@@ -49,6 +67,10 @@ func Load() *Config {
 		WorkerHeartbeatTTL:      time.Duration(hbTTLMs) * time.Millisecond,
 		TaskLeaseTTL:            time.Duration(leaseTTLMs) * time.Millisecond,
 		TaskLeaseRenewInterval:  time.Duration(leaseRenewMs) * time.Millisecond,
+		WorkerPoolSize:          poolSize,
+		WorkerQueueCapacity:     queueCapacity,
+		WorkerClaimBatchSize:    batchSize,
+		WorkerShutdownGrace:     time.Duration(graceMs) * time.Millisecond,
 	}
 }
 

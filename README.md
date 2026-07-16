@@ -6,7 +6,7 @@ PostgreSQL is the durable source of truth for execution states, while Redis is u
 
 ---
 
-## Architecture Diagram (Current Phase 8 Status)
+## Architecture Diagram (Current Phase 9 Status)
 
 ```mermaid
 graph TD
@@ -14,18 +14,16 @@ graph TD
     API -->|Validate DAG| DAG[DAG Validator]
     API -->|Transactional Write| DB[(PostgreSQL)]
     
-    DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W1[Worker 1]
-    DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W2[Worker 2]
-    DB -->|Claim READY task FOR UPDATE SKIP LOCKED| W3[Worker 3]
+    DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W1[Worker 1]
+    DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W2[Worker 2]
 
     W1 <-->|Heartbeats & Leases| Redis[(Redis)]
     W2 <-->|Heartbeats & Leases| Redis
-    W3 <-->|Heartbeats & Leases| Redis
 
-    subgraph Workers
-        W1
-        W2
-        W3
+    subgraph Worker Pool Architecture
+        direction TB
+        W1 -->|Buffered Channel| WP1[Worker Goroutines 1..N]
+        W2 -->|Buffered Channel| WP2[Worker Goroutines 1..N]
     end
 ```
 
@@ -311,3 +309,14 @@ FlowForge provides REST endpoints to inspect execution history and terminal fail
 
 ### 16. Known Limitations
 * Object storage integration for large payloads is deferred to future phases.
+
+### 17. High-Performance Worker Pools, Concurrency Bounds, & Graceful Shutdown
+Phase 9 introduces high-performance concurrent worker pools, bounded capacity-aware task claiming, and resilient graceful shutdown:
+* **Worker Pool Execution:** A worker process spawns a fixed set of concurrent execution goroutines bounded by `WORKER_POOL_SIZE`. These routines consume tasks from a shared, in-memory buffered queue channel (`WORKER_QUEUE_CAPACITY`).
+* **Capacity-Aware Backpressure:** The worker scheduler loop dynamically monitors slot availability:
+  `available_slots = WORKER_POOL_SIZE - active_executions - queued_tasks`
+  If `available_slots > 0`, it claims a batch of tasks up to the minimum of `available_slots` and `WORKER_CLAIM_BATCH_SIZE`. If capacity is fully saturated, claiming is paused, preventing memory overload.
+* **Atomic Batch Claiming:** Ready tasks are claimed in batches using a single database transaction query utilizing a Common Table Expression (CTE). This ensures `FOR UPDATE SKIP LOCKED`, priority ranking, and FIFO tie-breaking are executed atomically.
+* **Panic Isolation:** Executor runtime panics are intercepted using Go's `recover()`, recorded as execution failures with a stack trace in the task attempt details, and isolated to prevent cascading crashes.
+* **Graceful Shutdown Drainage:** On context termination, the scheduler loop halts task claiming. The worker drains all queued tasks, transactionally returning them to `READY` status in PostgreSQL, while active executions are given up to `WORKER_SHUTDOWN_GRACE_PERIOD_MS` to finish execution. Context deadline cancellation terminates any tasks exceeding this grace period.
+

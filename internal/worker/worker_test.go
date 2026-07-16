@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,25 @@ func (f *fakeRepository) ClaimNextReadyTask(ctx context.Context, workerID string
 	defer f.mu.Unlock()
 	if f.claimFunc != nil {
 		return f.claimFunc(ctx, workerID)
+	}
+	return nil, nil
+}
+
+func (f *fakeRepository) ClaimReadyTasksBatch(ctx context.Context, workerID string, limit int) ([]*model.ClaimedTask, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		return nil, nil
+	}
+	if f.claimFunc != nil {
+		task, err := f.claimFunc(ctx, workerID)
+		if err != nil {
+			return nil, err
+		}
+		if task == nil {
+			return nil, nil
+		}
+		return []*model.ClaimedTask{task}, nil
 	}
 	return nil, nil
 }
@@ -217,7 +237,7 @@ func (f *fakeCoordinator) Close() error {
 }
 
 func newTestWorker(id string, repo Repository, executors map[string]Executor, pollInterval time.Duration) *Worker {
-	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0)
+	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0, 1, 2, 1, 500*time.Millisecond)
 }
 
 type fakeExecutor struct {
@@ -516,6 +536,69 @@ func TestWorkerOrchestration(t *testing.T) {
 		err := w.Run(context.Background())
 		if err == nil {
 			t.Fatalf("expected error on failure DB failure, got nil")
+		}
+	})
+}
+
+func TestWorkerPoolConcurrencyAndPanics(t *testing.T) {
+	var cancel context.CancelFunc
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Run("executor panic is isolated and converted to failure", func(t *testing.T) {
+		var claimedTask = &model.ClaimedTask{
+			TaskRunID: "panic-run-1",
+			TaskType:  "PANIC_TYPE",
+		}
+		var claimedCount int64
+		repo := &fakeRepository{
+			claimFunc: func(ctx context.Context, workerID string) (*model.ClaimedTask, error) {
+				if atomic.AddInt64(&claimedCount, 1) == 1 {
+					return claimedTask, nil
+				}
+				return nil, nil
+			},
+			failFunc: func(ctx context.Context, taskRunID string, workerID string, errMsg string, isTimeout bool, fencingToken ...int64) error {
+				cancel()
+				return nil
+			},
+		}
+
+		panicExecutor := &fakeExecutor{
+			executeFunc: func(ctx context.Context, task *model.ClaimedTask) (json.RawMessage, error) {
+				panic("something went horribly wrong inside the task")
+			},
+		}
+
+		w := New(
+			"panic-worker",
+			repo,
+			map[string]Executor{"PANIC_TYPE": panicExecutor},
+			1*time.Millisecond,
+			0, 0, 0,
+			&fakeCoordinator{},
+			0, 0, 0, 0,
+			2, 4, 2, // poolSize=2, queueCapacity=4, batchSize=2
+			500*time.Millisecond,
+		)
+
+		err := w.Run(ctx)
+		if err != nil {
+			t.Fatalf("expected nil error on panic isolation run, got %v", err)
+		}
+
+		counters := w.GetCounters()
+		if counters.TotalPanics != 1 {
+			t.Errorf("expected 1 panic, got %d", counters.TotalPanics)
+		}
+		if counters.TotalFailed != 1 {
+			t.Errorf("expected 1 task failure, got %d", counters.TotalFailed)
+		}
+
+		repo.mu.Lock()
+		defer repo.mu.Unlock()
+		if repo.failedCalls != 1 {
+			t.Errorf("expected MarkTaskRunFailed to be called exactly once, got %d", repo.failedCalls)
 		}
 	})
 }
