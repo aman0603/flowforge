@@ -29,6 +29,9 @@ func setupTestDB(t *testing.T) *Repository {
 
 	// Drop existing tables to ensure latest schema is always provisioned
 	dropQueries := []string{
+		"DROP TABLE IF EXISTS outbox_events CASCADE;",
+		"DROP TABLE IF EXISTS dead_letter_tasks CASCADE;",
+		"DROP TABLE IF EXISTS task_attempts CASCADE;",
 		"DROP TABLE IF EXISTS task_dependencies CASCADE;",
 		"DROP TABLE IF EXISTS task_runs CASCADE;",
 		"DROP TABLE IF EXISTS task_definitions CASCADE;",
@@ -63,6 +66,9 @@ func setupTestDB(t *testing.T) *Repository {
 func clearDatabase(t *testing.T, repo *Repository) {
 	// Order is important because of foreign keys
 	queries := []string{
+		"TRUNCATE TABLE outbox_events RESTART IDENTITY CASCADE;",
+		"TRUNCATE TABLE dead_letter_tasks RESTART IDENTITY CASCADE;",
+		"TRUNCATE TABLE task_attempts RESTART IDENTITY CASCADE;",
 		"TRUNCATE TABLE task_dependencies RESTART IDENTITY CASCADE;",
 		"TRUNCATE TABLE task_runs RESTART IDENTITY CASCADE;",
 		"TRUNCATE TABLE task_definitions RESTART IDENTITY CASCADE;",
@@ -1924,49 +1930,49 @@ func TestBatchClaiming(t *testing.T) {
 		Description: "testing batch claiming",
 		Tasks: []model.TaskDefinitionInput{
 			{
-				Name:           "TaskA",
-				TaskType:       "SLEEP",
-				Config:         json.RawMessage(`{"duration_ms": 10}`),
-				MaxRetries:     1,
-				Priority:       10, // high priority
-				TimeoutMs:      5000,
-				Dependencies:   []string{},
+				Name:         "TaskA",
+				TaskType:     "SLEEP",
+				Config:       json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:   1,
+				Priority:     10, // high priority
+				TimeoutMs:    5000,
+				Dependencies: []string{},
 			},
 			{
-				Name:           "TaskB",
-				TaskType:       "SLEEP",
-				Config:         json.RawMessage(`{"duration_ms": 10}`),
-				MaxRetries:     1,
-				Priority:       20, // highest priority
-				TimeoutMs:      5000,
-				Dependencies:   []string{},
+				Name:         "TaskB",
+				TaskType:     "SLEEP",
+				Config:       json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:   1,
+				Priority:     20, // highest priority
+				TimeoutMs:    5000,
+				Dependencies: []string{},
 			},
 			{
-				Name:           "TaskC",
-				TaskType:       "SLEEP",
-				Config:         json.RawMessage(`{"duration_ms": 10}`),
-				MaxRetries:     1,
-				Priority:       5, // low priority
-				TimeoutMs:      5000,
-				Dependencies:   []string{},
+				Name:         "TaskC",
+				TaskType:     "SLEEP",
+				Config:       json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:   1,
+				Priority:     5, // low priority
+				TimeoutMs:    5000,
+				Dependencies: []string{},
 			},
 			{
-				Name:           "TaskD",
-				TaskType:       "SLEEP",
-				Config:         json.RawMessage(`{"duration_ms": 10}`),
-				MaxRetries:     1,
-				Priority:       10, // high priority (to test FIFO tie-breaker with TaskA)
-				TimeoutMs:      5000,
-				Dependencies:   []string{},
+				Name:         "TaskD",
+				TaskType:     "SLEEP",
+				Config:       json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:   1,
+				Priority:     10, // high priority (to test FIFO tie-breaker with TaskA)
+				TimeoutMs:    5000,
+				Dependencies: []string{},
 			},
 			{
-				Name:           "TaskE",
-				TaskType:       "SLEEP",
-				Config:         json.RawMessage(`{"duration_ms": 10}`),
-				MaxRetries:     1,
-				Priority:       100, // blocked priority
-				TimeoutMs:      5000,
-				Dependencies:   []string{"TaskB"},
+				Name:         "TaskE",
+				TaskType:     "SLEEP",
+				Config:       json.RawMessage(`{"duration_ms": 10}`),
+				MaxRetries:   1,
+				Priority:     100, // blocked priority
+				TimeoutMs:    5000,
+				Dependencies: []string{"TaskB"},
 			},
 		},
 	}
@@ -2057,5 +2063,3 @@ func TestBatchClaiming(t *testing.T) {
 		t.Errorf("expected fencing token 2 on reclaim, got %d", batch3[0].FencingToken)
 	}
 }
-
-

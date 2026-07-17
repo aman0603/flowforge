@@ -203,3 +203,127 @@ type TaskHistoryResponse struct {
 	Status    string        `json:"status"`
 	Attempts  []TaskAttempt `json:"attempts"`
 }
+
+// Workflow event types
+const (
+	EventWorkflowStarted   = "WorkflowStarted"
+	EventWorkflowCompleted = "WorkflowCompleted"
+	EventWorkflowFailed    = "WorkflowFailed"
+	EventTaskStarted       = "TaskStarted"
+	EventTaskCompleted     = "TaskCompleted"
+	EventTaskFailed        = "TaskFailed"
+	EventTaskTimedOut      = "TaskTimedOut"
+	EventRetryScheduled    = "RetryScheduled"
+	EventRetryExhausted    = "RetryExhausted"
+	EventDLQCreated        = "DLQCreated"
+	EventTaskRecovered     = "TaskRecovered"
+	EventRetryPromoted     = "RetryPromoted"
+)
+
+// EventEnvelope represents a versioned workflow event published to Kafka.
+type EventEnvelope struct {
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  int             `json:"event_version"`
+	OccurredAt    time.Time       `json:"occurred_at"`
+	AggregateType string          `json:"aggregate_type"`
+	AggregateID   string          `json:"aggregate_id"`
+	WorkflowRunID string          `json:"workflow_run_id"`
+	TaskRunID     *string         `json:"task_run_id,omitempty"`
+	Sequence      int64           `json:"sequence"`
+	Payload       json.RawMessage `json:"payload"`
+}
+
+// OutboxEvent represents a pending or published event stored in the transactional outbox.
+type OutboxEvent struct {
+	ID            string          `json:"id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  int             `json:"event_version"`
+	AggregateType string          `json:"aggregate_type"`
+	AggregateID   string          `json:"aggregate_id"`
+	WorkflowRunID string          `json:"workflow_run_id"`
+	TaskRunID     *string         `json:"task_run_id,omitempty"`
+	Sequence      int64           `json:"sequence"`
+	Payload       json.RawMessage `json:"payload"`
+	CreatedAt     time.Time       `json:"created_at"`
+	AvailableAt   time.Time       `json:"available_at"`
+	Attempts      int             `json:"attempts"`
+	LastError     *string         `json:"last_error,omitempty"`
+	LockedBy      *string         `json:"locked_by,omitempty"`
+	LockedUntil   *time.Time      `json:"locked_until,omitempty"`
+	PublishedAt   *time.Time      `json:"published_at,omitempty"`
+}
+
+// WorkflowStartedPayload contains the metadata for a WorkflowStarted event.
+type WorkflowStartedPayload struct {
+	WorkflowDefinitionID string          `json:"workflow_definition_id"`
+	Input                json.RawMessage `json:"input"`
+}
+
+// WorkflowCompletedPayload contains the metadata for a WorkflowCompleted event.
+type WorkflowCompletedPayload struct {
+	Output json.RawMessage `json:"output"`
+}
+
+// WorkflowFailedPayload contains the metadata for a WorkflowFailed event.
+type WorkflowFailedPayload struct {
+	ErrorMessage string `json:"error_message"`
+}
+
+// TaskStartedPayload contains the metadata for a TaskStarted event.
+type TaskStartedPayload struct {
+	TaskDefinitionID string          `json:"task_definition_id"`
+	Name             string          `json:"name"`
+	TaskType         string          `json:"task_type"`
+	Input            json.RawMessage `json:"input"`
+	WorkerID         string          `json:"worker_id"`
+	FencingToken     int64           `json:"fencing_token"`
+}
+
+// TaskCompletedPayload contains the metadata for a TaskCompleted event.
+type TaskCompletedPayload struct {
+	Output json.RawMessage `json:"output"`
+}
+
+// TaskFailedPayload contains the metadata for a TaskFailed event.
+type TaskFailedPayload struct {
+	ErrorMessage string `json:"error_message"`
+	Attempt      int    `json:"attempt"`
+}
+
+// TaskTimedOutPayload contains the metadata for a TaskTimedOut event.
+type TaskTimedOutPayload struct {
+	TimeoutMs int `json:"timeout_ms"`
+	Attempt   int `json:"attempt"`
+}
+
+// RetryScheduledPayload contains the metadata for a RetryScheduled event.
+type RetryScheduledPayload struct {
+	NextRetryAt time.Time `json:"next_retry_at"`
+	Attempt     int       `json:"attempt"`
+}
+
+// RetryExhaustedPayload contains the metadata for a RetryExhausted event.
+type RetryExhaustedPayload struct {
+	ErrorMessage string `json:"error_message"`
+	Attempts     int    `json:"attempts"`
+}
+
+// DLQCreatedPayload contains the metadata for a DLQCreated event.
+type DLQCreatedPayload struct {
+	TerminalStatus string  `json:"terminal_status"`
+	FailureType    string  `json:"failure_type"`
+	Reason         *string `json:"reason,omitempty"`
+	FinalAttempt   int     `json:"final_attempt"`
+}
+
+// TaskRecoveredPayload contains the metadata for a TaskRecovered event.
+type TaskRecoveredPayload struct {
+	PreviousWorkerID string `json:"previous_worker_id"`
+	FencingToken     int64  `json:"fencing_token"`
+}
+
+// RetryPromotedPayload contains the metadata for a RetryPromoted event.
+type RetryPromotedPayload struct {
+	FencingToken int64 `json:"fencing_token"`
+}

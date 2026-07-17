@@ -178,7 +178,7 @@ func (w *Worker) GetCounters() SchedulerCounters {
 
 // Run starts the worker process and its worker pool.
 func (w *Worker) Run(ctx context.Context) error {
-	log.Printf("[worker-%s] Starting worker loop (poolSize=%d, queueCapacity=%d, batchSize=%d)...", 
+	log.Printf("[worker-%s] Starting worker loop (poolSize=%d, queueCapacity=%d, batchSize=%d)...",
 		w.id, w.poolSize, w.queueCapacity, w.batchSize)
 
 	// Initialize the error channel

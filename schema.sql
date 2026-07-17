@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     error_message TEXT,
     started_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
+    event_sequence BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_workflow_run_status CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED'))
 );
@@ -120,3 +121,27 @@ CREATE TABLE IF NOT EXISTS dead_letter_tasks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dead_letter_tasks_workflow_run ON dead_letter_tasks(workflow_run_id);
+
+-- 8. Outbox Events
+CREATE TABLE IF NOT EXISTS outbox_events (
+    id UUID PRIMARY KEY,
+    event_type VARCHAR(255) NOT NULL,
+    event_version INT NOT NULL,
+    aggregate_type VARCHAR(255) NOT NULL,
+    aggregate_id UUID NOT NULL,
+    workflow_run_id UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    task_run_id UUID REFERENCES task_runs(id) ON DELETE CASCADE,
+    sequence BIGINT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    available_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    locked_by VARCHAR(255),
+    locked_until TIMESTAMP WITH TIME ZONE,
+    published_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT unique_workflow_run_event_sequence UNIQUE (workflow_run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_events_pending ON outbox_events(published_at, available_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_events_locked_until ON outbox_events(locked_until);

@@ -26,6 +26,7 @@ func setupAPITestDB(t *testing.T) *repository.Repository {
 
 	// Drop existing tables to ensure latest schema is always provisioned
 	dropQueries := []string{
+		"DROP TABLE IF EXISTS outbox_events CASCADE;",
 		"DROP TABLE IF EXISTS dead_letter_tasks CASCADE;",
 		"DROP TABLE IF EXISTS task_attempts CASCADE;",
 		"DROP TABLE IF EXISTS task_dependencies CASCADE;",

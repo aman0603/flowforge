@@ -29,6 +29,7 @@ func setupIntegrationTestDB(t *testing.T) *repository.Repository {
 	defer db.Close()
 
 	dropQueries := []string{
+		"DROP TABLE IF EXISTS outbox_events CASCADE;",
 		"DROP TABLE IF EXISTS task_dependencies CASCADE;",
 		"DROP TABLE IF EXISTS task_runs CASCADE;",
 		"DROP TABLE IF EXISTS task_definitions CASCADE;",
