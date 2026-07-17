@@ -257,6 +257,16 @@ func (r *Repository) CreateWorkflowRun(ctx context.Context, definitionID string,
 		}
 	}
 
+	// Insert WorkflowStarted event
+	payload := model.WorkflowStartedPayload{
+		WorkflowDefinitionID: definitionID,
+		Input:                input,
+	}
+	err = r.insertOutboxEventTx(ctx, tx, runID, model.EventWorkflowStarted, 1, "workflow_run", runID, nil, payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert WorkflowStarted outbox event: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -466,7 +476,9 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 	updateTaskQuery := fmt.Sprintf(`
 		UPDATE task_runs tr
 		SET status = 'RUNNING', started_at = NOW(), attempts = attempts + 1
-		WHERE tr.id = $1
+		FROM task_definitions td
+		WHERE tr.task_definition_id = td.id
+		  AND tr.id = $1
 		  AND tr.status = 'CLAIMED'
 		  AND tr.worker_id = $2
 		  %s
@@ -476,13 +488,21 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 			  WHERE wr.id = tr.workflow_run_id
 				AND wr.status IN ('PENDING', 'RUNNING')
 		  )
-		RETURNING tr.workflow_run_id, tr.attempts, tr.claimed_at
+		RETURNING tr.workflow_run_id, tr.attempts, tr.claimed_at, tr.task_definition_id, td.name, td.task_type, tr.input, tr.fencing_token
 	`, tokenCheck)
 
 	var workflowRunID string
 	var newAttempts int
 	var claimedAt sql.NullTime
-	err = tx.QueryRowContext(ctx, updateTaskQuery, taskRunID, workerID).Scan(&workflowRunID, &newAttempts, &claimedAt)
+	var taskDefinitionID string
+	var taskName string
+	var taskType string
+	var taskInput json.RawMessage
+	var fencingTokenVal int64
+
+	err = tx.QueryRowContext(ctx, updateTaskQuery, taskRunID, workerID).Scan(
+		&workflowRunID, &newAttempts, &claimedAt, &taskDefinitionID, &taskName, &taskType, &taskInput, &fencingTokenVal,
+	)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
@@ -502,6 +522,20 @@ func (r *Repository) StartTaskRun(ctx context.Context, taskRunID string, workerI
 	_, err = tx.ExecContext(ctx, insertAttemptQuery, attemptID, taskRunID, workflowRunID, newAttempts, workerID, claimedAt, actualToken)
 	if err != nil {
 		return fmt.Errorf("failed to insert task attempt: %w", err)
+	}
+
+	// Insert TaskStarted event
+	taskStartedPayload := model.TaskStartedPayload{
+		TaskDefinitionID: taskDefinitionID,
+		Name:             taskName,
+		TaskType:         taskType,
+		Input:            taskInput,
+		WorkerID:         workerID,
+		FencingToken:     fencingTokenVal,
+	}
+	err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskStarted, 1, "task_run", taskRunID, &taskRunID, taskStartedPayload)
+	if err != nil {
+		return fmt.Errorf("failed to insert TaskStarted outbox event: %w", err)
 	}
 
 	// 2. Transition workflow PENDING -> RUNNING
@@ -590,6 +624,15 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 		return fmt.Errorf("failed to update task attempt status: %w", err)
 	}
 
+	// Insert TaskCompleted event
+	taskCompletedPayload := model.TaskCompletedPayload{
+		Output: output,
+	}
+	err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskCompleted, 1, "task_run", taskRunID, &taskRunID, taskCompletedPayload)
+	if err != nil {
+		return fmt.Errorf("failed to insert TaskCompleted outbox event: %w", err)
+	}
+
 	// 4. Unlock eligible direct child tasks (PENDING -> READY)
 	const unlockQuery = `
 		UPDATE task_runs
@@ -628,9 +671,28 @@ func (r *Repository) MarkTaskRunCompleted(ctx context.Context, taskRunID string,
 				AND status != 'COMPLETED'
 		  )
 	`
-	_, err = tx.ExecContext(ctx, completeWorkflowQuery, workflowRunID)
+	resWf, err := tx.ExecContext(ctx, completeWorkflowQuery, workflowRunID)
 	if err != nil {
 		return fmt.Errorf("failed to complete workflow run: %w", err)
+	}
+	wfAffected, err := resWf.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get workflow completion rows affected: %w", err)
+	}
+
+	if wfAffected > 0 {
+		var wfOutput json.RawMessage
+		err = tx.QueryRowContext(ctx, "SELECT output FROM workflow_runs WHERE id = $1", workflowRunID).Scan(&wfOutput)
+		if err != nil {
+			return fmt.Errorf("failed to read workflow output: %w", err)
+		}
+		wfCompletedPayload := model.WorkflowCompletedPayload{
+			Output: wfOutput,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventWorkflowCompleted, 1, "workflow_run", workflowRunID, nil, wfCompletedPayload)
+		if err != nil {
+			return fmt.Errorf("failed to insert WorkflowCompleted outbox event: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -675,17 +737,17 @@ func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, wo
 
 	// 1. Read task details and definition limits without locking
 	var workflowRunID string
-	var attempts, maxRetries, retryBackoff int
+	var attempts, maxRetries, retryBackoff, timeoutMs int
 	var currentStatus string
 	var currentWorkerID sql.NullString
 	var currentFencingToken int64
 	const selectTaskInfo = `
-		SELECT tr.workflow_run_id, tr.attempts, td.max_retries, td.retry_backoff_ms, tr.status, tr.worker_id, tr.fencing_token
+		SELECT tr.workflow_run_id, tr.attempts, td.max_retries, td.retry_backoff_ms, td.timeout_ms, tr.status, tr.worker_id, tr.fencing_token
 		FROM task_runs tr
 		JOIN task_definitions td ON tr.task_definition_id = td.id
 		WHERE tr.id = $1
 	`
-	err = tx.QueryRowContext(ctx, selectTaskInfo, taskRunID).Scan(&workflowRunID, &attempts, &maxRetries, &retryBackoff, &currentStatus, &currentWorkerID, &currentFencingToken)
+	err = tx.QueryRowContext(ctx, selectTaskInfo, taskRunID).Scan(&workflowRunID, &attempts, &maxRetries, &retryBackoff, &timeoutMs, &currentStatus, &currentWorkerID, &currentFencingToken)
 	if err == sql.ErrNoRows {
 		return ErrInvalidTaskTransition
 	} else if err != nil {
@@ -749,6 +811,33 @@ func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, wo
 		if err != nil {
 			return fmt.Errorf("failed to schedule task retry: %w", err)
 		}
+
+		// Emit TaskFailed or TaskTimedOut, and RetryScheduled outbox events
+		if isTimeout {
+			taskTimedOutPayload := model.TaskTimedOutPayload{
+				TimeoutMs: timeoutMs,
+				Attempt:   attempts,
+			}
+			err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskTimedOut, 1, "task_run", taskRunID, &taskRunID, taskTimedOutPayload)
+		} else {
+			taskFailedPayload := model.TaskFailedPayload{
+				ErrorMessage: errMsg,
+				Attempt:      attempts,
+			}
+			err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskFailed, 1, "task_run", taskRunID, &taskRunID, taskFailedPayload)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to insert task failure outbox event: %w", err)
+		}
+
+		retryScheduledPayload := model.RetryScheduledPayload{
+			NextRetryAt: nextRetryAt,
+			Attempt:     attempts,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventRetryScheduled, 1, "task_run", taskRunID, &taskRunID, retryScheduledPayload)
+		if err != nil {
+			return fmt.Errorf("failed to insert RetryScheduled outbox event: %w", err)
+		}
 	} else {
 		// Retry budget exhausted! Permanent task and workflow failure.
 		var terminalStatus string
@@ -797,6 +886,52 @@ func (r *Repository) MarkTaskRunFailed(ctx context.Context, taskRunID string, wo
 		if err != nil {
 			return fmt.Errorf("failed to update workflow status to FAILED: %w", err)
 		}
+
+		// Emit TaskFailed or TaskTimedOut, RetryExhausted, DLQCreated, and WorkflowFailed events
+		if isTimeout {
+			taskTimedOutPayload := model.TaskTimedOutPayload{
+				TimeoutMs: timeoutMs,
+				Attempt:   attempts,
+			}
+			err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskTimedOut, 1, "task_run", taskRunID, &taskRunID, taskTimedOutPayload)
+		} else {
+			taskFailedPayload := model.TaskFailedPayload{
+				ErrorMessage: errMsg,
+				Attempt:      attempts,
+			}
+			err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskFailed, 1, "task_run", taskRunID, &taskRunID, taskFailedPayload)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to insert task failure outbox event: %w", err)
+		}
+
+		retryExhaustedPayload := model.RetryExhaustedPayload{
+			ErrorMessage: errMsg,
+			Attempts:     attempts,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventRetryExhausted, 1, "task_run", taskRunID, &taskRunID, retryExhaustedPayload)
+		if err != nil {
+			return fmt.Errorf("failed to insert RetryExhausted outbox event: %w", err)
+		}
+
+		dlqCreatedPayload := model.DLQCreatedPayload{
+			TerminalStatus: terminalStatus,
+			FailureType:    failureType,
+			Reason:         &errMsg,
+			FinalAttempt:   attempts,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventDLQCreated, 1, "task_run", taskRunID, &taskRunID, dlqCreatedPayload)
+		if err != nil {
+			return fmt.Errorf("failed to insert DLQCreated outbox event: %w", err)
+		}
+
+		wfFailedPayload := model.WorkflowFailedPayload{
+			ErrorMessage: "Task failed: " + errMsg,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventWorkflowFailed, 1, "workflow_run", workflowRunID, nil, wfFailedPayload)
+		if err != nil {
+			return fmt.Errorf("failed to insert WorkflowFailed outbox event: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -840,17 +975,33 @@ func (r *Repository) RecoverStaleTasks(
 		  AND tr.status = 'CLAIMED'
 		  AND tr.claimed_at < NOW() - ($1 * INTERVAL '1 second')
 		  AND wr.status IN ('PENDING', 'RUNNING')
+		RETURNING tr.id, tr.workflow_run_id, tr.worker_id, tr.fencing_token
 	`
 	claimedSecs := claimedTimeout.Seconds()
-	claimedRes, err := tx.ExecContext(ctx, recoverClaimedQuery, claimedSecs)
+	rowsClaimed, err := tx.QueryContext(ctx, recoverClaimedQuery, claimedSecs)
 	if err != nil {
 		return res, fmt.Errorf("failed to recover stale CLAIMED tasks: %w", err)
 	}
-	claimedCount, err := claimedRes.RowsAffected()
-	if err != nil {
-		return res, fmt.Errorf("failed to read claimed rows affected: %w", err)
+	defer rowsClaimed.Close()
+
+	type recoveredTaskInfo struct {
+		id            string
+		workflowRunID string
+		workerID      sql.NullString
+		fencingToken  int64
 	}
-	res.ClaimedRecovered = claimedCount
+	var recoveredClaimed []recoveredTaskInfo
+	for rowsClaimed.Next() {
+		var rt recoveredTaskInfo
+		if err := rowsClaimed.Scan(&rt.id, &rt.workflowRunID, &rt.workerID, &rt.fencingToken); err != nil {
+			return res, fmt.Errorf("failed to scan recovered claimed task: %w", err)
+		}
+		recoveredClaimed = append(recoveredClaimed, rt)
+	}
+	if err := rowsClaimed.Err(); err != nil {
+		return res, fmt.Errorf("error reading recovered claimed tasks: %w", err)
+	}
+	res.ClaimedRecovered = int64(len(recoveredClaimed))
 
 	// 2. Recover stale RUNNING tasks
 	const recoverRunningQuery = `
@@ -867,32 +1018,34 @@ func (r *Repository) RecoverStaleTasks(
 		  AND tr.status = 'RUNNING'
 		  AND tr.started_at < NOW() - ($1 * INTERVAL '1 second')
 		  AND wr.status IN ('PENDING', 'RUNNING')
-		RETURNING tr.id, tr.attempts
+		RETURNING tr.id, tr.workflow_run_id, tr.worker_id, tr.fencing_token, tr.attempts
 	`
 	runningSecs := runningTimeout.Seconds()
-	rows, err := tx.QueryContext(ctx, recoverRunningQuery, runningSecs)
+	rowsRunning, err := tx.QueryContext(ctx, recoverRunningQuery, runningSecs)
 	if err != nil {
 		return res, fmt.Errorf("failed to recover stale RUNNING tasks: %w", err)
 	}
-	defer rows.Close()
+	defer rowsRunning.Close()
 
-	type recoveredTask struct {
-		id       string
-		attempts int
+	type recoveredRunningInfo struct {
+		id            string
+		workflowRunID string
+		workerID      sql.NullString
+		fencingToken  int64
+		attempts      int
 	}
-	var recovered []recoveredTask
-	for rows.Next() {
-		var rt recoveredTask
-		if err := rows.Scan(&rt.id, &rt.attempts); err != nil {
-			return res, fmt.Errorf("failed to scan recovered task: %w", err)
+	var recoveredRunning []recoveredRunningInfo
+	for rowsRunning.Next() {
+		var rt recoveredRunningInfo
+		if err := rowsRunning.Scan(&rt.id, &rt.workflowRunID, &rt.workerID, &rt.fencingToken, &rt.attempts); err != nil {
+			return res, fmt.Errorf("failed to scan recovered running task: %w", err)
 		}
-		recovered = append(recovered, rt)
+		recoveredRunning = append(recoveredRunning, rt)
 	}
-	if err := rows.Err(); err != nil {
-		return res, fmt.Errorf("error iterating recovered task rows: %w", err)
+	if err := rowsRunning.Err(); err != nil {
+		return res, fmt.Errorf("error reading recovered running tasks: %w", err)
 	}
-
-	res.RunningRecovered = int64(len(recovered))
+	res.RunningRecovered = int64(len(recoveredRunning))
 
 	// Update corresponding task attempts to ORPHANED
 	const orphanAttemptsQuery = `
@@ -900,10 +1053,41 @@ func (r *Repository) RecoverStaleTasks(
 		SET status = 'ORPHANED', completed_at = NOW(), failure_type = 'WORKER_LOST', error_message = 'worker execution became stale'
 		WHERE task_run_id = $1 AND attempt_number = $2 AND status = 'RUNNING'
 	`
-	for _, rt := range recovered {
+	for _, rt := range recoveredRunning {
 		_, err = tx.ExecContext(ctx, orphanAttemptsQuery, rt.id, rt.attempts)
 		if err != nil {
 			return res, fmt.Errorf("failed to orphan task attempt for task %s, attempt %d: %w", rt.id, rt.attempts, err)
+		}
+	}
+
+	// Emit TaskRecovered events for all recovered tasks
+	for _, rt := range recoveredClaimed {
+		var workerIDStr string
+		if rt.workerID.Valid {
+			workerIDStr = rt.workerID.String
+		}
+		taskRecoveredPayload := model.TaskRecoveredPayload{
+			PreviousWorkerID: workerIDStr,
+			FencingToken:     rt.fencingToken,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, rt.workflowRunID, model.EventTaskRecovered, 1, "task_run", rt.id, &rt.id, taskRecoveredPayload)
+		if err != nil {
+			return res, fmt.Errorf("failed to insert TaskRecovered outbox event: %w", err)
+		}
+	}
+
+	for _, rt := range recoveredRunning {
+		var workerIDStr string
+		if rt.workerID.Valid {
+			workerIDStr = rt.workerID.String
+		}
+		taskRecoveredPayload := model.TaskRecoveredPayload{
+			PreviousWorkerID: workerIDStr,
+			FencingToken:     rt.fencingToken,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, rt.workflowRunID, model.EventTaskRecovered, 1, "task_run", rt.id, &rt.id, taskRecoveredPayload)
+		if err != nil {
+			return res, fmt.Errorf("failed to insert TaskRecovered outbox event: %w", err)
 		}
 	}
 
@@ -916,6 +1100,12 @@ func (r *Repository) RecoverStaleTasks(
 
 // PromoteDueRetries transitions due tasks from RETRY_WAIT to READY.
 func (r *Repository) PromoteDueRetries(ctx context.Context) (int64, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to start PromoteDueRetries transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	const promoteQuery = `
 		UPDATE task_runs tr
 		SET status = 'READY',
@@ -925,16 +1115,46 @@ func (r *Repository) PromoteDueRetries(ctx context.Context) (int64, error) {
 		  AND tr.status = 'RETRY_WAIT'
 		  AND tr.next_retry_at <= NOW()
 		  AND wr.status IN ('PENDING', 'RUNNING')
+		RETURNING tr.id, tr.workflow_run_id, tr.fencing_token
 	`
-	res, err := r.db.ExecContext(ctx, promoteQuery)
+	rows, err := tx.QueryContext(ctx, promoteQuery)
 	if err != nil {
 		return 0, fmt.Errorf("failed to promote due retries: %w", err)
 	}
-	count, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get rows affected for due retries: %w", err)
+	defer rows.Close()
+
+	type promotedTask struct {
+		id            string
+		workflowRunID string
+		fencingToken  int64
 	}
-	return count, nil
+	var promoted []promotedTask
+	for rows.Next() {
+		var pt promotedTask
+		if err := rows.Scan(&pt.id, &pt.workflowRunID, &pt.fencingToken); err != nil {
+			return 0, fmt.Errorf("failed to scan promoted task: %w", err)
+		}
+		promoted = append(promoted, pt)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("error reading promoted tasks: %w", err)
+	}
+
+	for _, pt := range promoted {
+		payload := model.RetryPromotedPayload{
+			FencingToken: pt.fencingToken,
+		}
+		err = r.insertOutboxEventTx(ctx, tx, pt.workflowRunID, model.EventRetryPromoted, 1, "task_run", pt.id, &pt.id, payload)
+		if err != nil {
+			return 0, fmt.Errorf("failed to insert RetryPromoted outbox event: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit PromoteDueRetries transaction: %w", err)
+	}
+
+	return int64(len(promoted)), nil
 }
 
 // GetWorkflowRunHistory retrieves the history of a workflow run and all its attempts.
@@ -1186,6 +1406,16 @@ func (r *Repository) RecoverRunningTask(ctx context.Context, taskRunID string, f
 	}
 	defer tx.Rollback()
 
+	// Query workflow_run_id and worker_id first
+	var workflowRunID string
+	var previousWorkerID sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT workflow_run_id, worker_id FROM task_runs WHERE id = $1", taskRunID).Scan(&workflowRunID, &previousWorkerID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("failed to select task run info for recovery: %w", err)
+	}
+
 	// Guard by status = 'RUNNING' and fencing_token
 	const updateQuery = `
 		UPDATE task_runs
@@ -1217,11 +1447,41 @@ func (r *Repository) RecoverRunningTask(ctx context.Context, taskRunID string, f
 		return false, fmt.Errorf("failed to mark attempt as ORPHANED: %w", err)
 	}
 
+	// Insert TaskRecovered event
+	var workerIDStr string
+	if previousWorkerID.Valid {
+		workerIDStr = previousWorkerID.String
+	}
+	taskRecoveredPayload := model.TaskRecoveredPayload{
+		PreviousWorkerID: workerIDStr,
+		FencingToken:     fencingToken,
+	}
+	err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskRecovered, 1, "task_run", taskRunID, &taskRunID, taskRecoveredPayload)
+	if err != nil {
+		return false, fmt.Errorf("failed to insert TaskRecovered outbox event: %w", err)
+	}
+
 	return true, tx.Commit()
 }
 
 // RecoverClaimedTask resets a CLAIMED task run back to READY.
 func (r *Repository) RecoverClaimedTask(ctx context.Context, taskRunID string, fencingToken int64) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to start RecoverClaimedTask transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Query workflow_run_id and worker_id first
+	var workflowRunID string
+	var previousWorkerID sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT workflow_run_id, worker_id FROM task_runs WHERE id = $1", taskRunID).Scan(&workflowRunID, &previousWorkerID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("failed to select task run info for recovery: %w", err)
+	}
+
 	const updateQuery = `
 		UPDATE task_runs
 		SET status = 'READY',
@@ -1229,10 +1489,81 @@ func (r *Repository) RecoverClaimedTask(ctx context.Context, taskRunID string, f
 			claimed_at = NULL
 		WHERE id = $1 AND status = 'CLAIMED' AND fencing_token = $2
 	`
-	res, err := r.db.ExecContext(ctx, updateQuery, taskRunID, fencingToken)
+	res, err := tx.ExecContext(ctx, updateQuery, taskRunID, fencingToken)
 	if err != nil {
 		return false, fmt.Errorf("failed to update claimed task to READY: %w", err)
 	}
 	rows, err := res.RowsAffected()
-	return rows > 0, nil
+	if err != nil || rows == 0 {
+		return false, err
+	}
+
+	// Insert TaskRecovered event
+	var workerIDStr string
+	if previousWorkerID.Valid {
+		workerIDStr = previousWorkerID.String
+	}
+	taskRecoveredPayload := model.TaskRecoveredPayload{
+		PreviousWorkerID: workerIDStr,
+		FencingToken:     fencingToken,
+	}
+	err = r.insertOutboxEventTx(ctx, tx, workflowRunID, model.EventTaskRecovered, 1, "task_run", taskRunID, &taskRunID, taskRecoveredPayload)
+	if err != nil {
+		return false, fmt.Errorf("failed to insert TaskRecovered outbox event: %w", err)
+	}
+
+	err = tx.Commit()
+	return true, err
+}
+
+// insertOutboxEventTx inserts a new outbox event atomically.
+// It locks the workflow run, allocates the next sequence number, and inserts the event.
+func (r *Repository) insertOutboxEventTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	workflowRunID string,
+	eventType string,
+	eventVersion int,
+	aggregateType string,
+	aggregateID string,
+	taskRunID *string,
+	payload interface{},
+) error {
+	// 1. Get and increment the sequence number on the workflow run.
+	var sequence int64
+	const incrementSeqQuery = `
+		UPDATE workflow_runs
+		SET event_sequence = event_sequence + 1
+		WHERE id = $1
+		RETURNING event_sequence
+	`
+	err := tx.QueryRowContext(ctx, incrementSeqQuery, workflowRunID).Scan(&sequence)
+	if err != nil {
+		return fmt.Errorf("failed to increment workflow run event sequence: %w", err)
+	}
+
+	// 2. Marshal the payload to json
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event payload: %w", err)
+	}
+
+	// 3. Insert the outbox event
+	eventID := newUUID()
+	now := time.Now().UTC()
+	const insertQuery = `
+		INSERT INTO outbox_events (
+			id, event_type, event_version, aggregate_type, aggregate_id,
+			workflow_run_id, task_run_id, sequence, payload, created_at, available_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`
+	_, err = tx.ExecContext(ctx, insertQuery,
+		eventID, eventType, eventVersion, aggregateType, aggregateID,
+		workflowRunID, taskRunID, sequence, payloadBytes, now, now,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert outbox event: %w", err)
+	}
+
+	return nil
 }

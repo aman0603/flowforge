@@ -1,6 +1,6 @@
 # Phase 10 Status
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-18
 
 ## Current state
 
@@ -20,14 +20,14 @@ Last reviewed: 2026-07-17
 - [x] Failure, concurrency, performance, security, and testing requirements defined.
 - [x] Loop-by-loop commit boundaries defined.
 - [x] Loop 1: Add event contracts and outbox schema.
+- [x] Loop 2: Insert events atomically with repository transitions.
 
 ## In progress
 
-- [ ] Loop 2: Insert events atomically with repository transitions.
+- [ ] Loop 3: Add Kafka configuration and Docker Compose infrastructure.
 
 ## Remaining
 
-- [ ] Loop 3: Add Kafka configuration and Docker Compose infrastructure.
 - [ ] Loop 4: Implement the outbox publisher.
 - [ ] Loop 5: Deploy the publisher as a standalone service.
 - [ ] Loop 6: Add an idempotent consumer example.
