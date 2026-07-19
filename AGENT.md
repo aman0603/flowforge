@@ -17,7 +17,7 @@ For the active phase:
 5. Update `STATUS.md` after each completed loop, including what remains.
 6. Record material deviations from the plan in the phase folder.
 
-Current phase plan: `docs/phases/phase-10-transactional-outbox-kafka/`
+Current phase plan: `docs/phases/phase-11-grpc-internal-communication/`
 
 ### Tech Stack
 
