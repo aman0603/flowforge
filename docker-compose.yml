@@ -2,6 +2,7 @@ services:
   db:
     image: postgres:16-alpine
     container_name: flowforge-db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: "${POSTGRES_USER:-postgres}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
@@ -19,6 +20,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: flowforge-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -30,6 +32,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     container_name: flowforge-kafka
+    restart: unless-stopped
     ports:
       - "9092:9092"
     environment:
@@ -58,6 +61,21 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: flowforge-app
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
     ports:
       - "8080:8080"
     environment:
@@ -88,6 +106,17 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["./scheduler"]
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
     ports:
       - "9091:9090"
     environment:
@@ -107,6 +136,17 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["./recovery"]
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
     ports:
       - "9092:9090"
     environment:
@@ -126,6 +166,17 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["./worker"]
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
     environment:
       DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       WORKER_POLL_INTERVAL: "${WORKER_POLL_INTERVAL:-1s}"
@@ -168,6 +219,17 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["./publisher"]
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
     environment:
       DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       KAFKA_BROKERS: "kafka:29092"
@@ -193,6 +255,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: flowforge-prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
@@ -206,6 +269,7 @@ services:
   grafana:
     image: grafana/grafana:11.2.0
     container_name: flowforge-grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
@@ -221,6 +285,7 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.60
     container_name: flowforge-jaeger
+    restart: unless-stopped
     ports:
       - "16686:16686"
       - "4317:4317"

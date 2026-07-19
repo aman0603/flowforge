@@ -52,7 +52,15 @@ func main() {
 	}
 	defer repo.Close()
 
-	grpcSrv := grpcutil.NewServer(cfg.GRPCAddr)
+	grpcSrv, err := grpcutil.NewServerTLS(cfg.GRPCAddr, grpcutil.TLSConfig{
+		Enabled:  cfg.GRPCTLSEnabled,
+		CertFile: cfg.GRPCTLSCertFile,
+		KeyFile:  cfg.GRPCTLSKeyFile,
+		CAFile:   cfg.GRPCTLSCAFile,
+	})
+	if err != nil {
+		logger.Fatal("failed to create gRPC server", zap.Error(err))
+	}
 	pbrecov.RegisterRecoveryServiceServer(grpcSrv.Server(), recovery.NewGRPCServer(repo))
 	health.RegisterHealthServiceServer(grpcSrv.Server(), grpcutil.NewHealthServer(grpcutil.NewDBHealthChecker(repo)))
 

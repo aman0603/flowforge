@@ -520,4 +520,28 @@ The publisher logs a metrics snapshot every 30s:
 `published`, `failed`, `retried`, `cleaned`. Watch `failed` and the outbox
 backlog (`published_at IS NULL` row count) to detect Kafka or publisher issues.
 
+---
+
+## Phase 13: Production Hardening & Scalability
+
+Production operations documentation lives in [`docs/production/`](docs/production/README.md).
+All hardening features (DB pool tuning, pprof, gRPC TLS/mTLS, HTTP rate limiting,
+request body limits) ship **off by default** — behavior is unchanged unless
+explicitly enabled.
+
+* **[Production Readiness Checklist](docs/production/PRODUCTION-READINESS-CHECKLIST.md)** — go/no-go gate.
+* **[Configuration Reference](docs/production/CONFIGURATION.md)** — all environment variables.
+* **[Deployment Guide](docs/production/DEPLOYMENT.md)** — build, image, rollout, health probes.
+* **[Operations Runbook](docs/production/OPERATIONS.md)** — monitoring, alerts, incidents.
+* **[Troubleshooting](docs/production/TROUBLESHOOTING.md)** — symptom-oriented fixes.
+* **[Scaling Guide](docs/production/SCALING.md)** — horizontal scaling & DB connection budget.
+* **[Performance](docs/production/PERFORMANCE.md)** — benchmarks, pprof, load testing.
+* **[Security](docs/production/SECURITY.md)** — TLS/mTLS, rate limits, secrets.
+* **[Resilience & Chaos](docs/production/CHAOS.md)** — failure model + chaos suite (`go test -tags chaos ./...`).
+* **[Backup & DR](docs/production/BACKUP-RECOVERY.md)** — backups and disaster recovery.
+
+The container image runs as a **non-root** user with a built-in `HEALTHCHECK`,
+and `docker-compose.yml` sets restart policies, resource limits, and per-service
+healthchecks.
+
 

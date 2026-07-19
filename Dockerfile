@@ -24,8 +24,11 @@ FROM alpine:3.20
 
 WORKDIR /app
 
-# Install ca-certificates in case we need HTTPS outcalls later
-RUN apk --no-cache add ca-certificates
+# ca-certificates for TLS; wget (busybox) is used by the container healthcheck.
+RUN apk --no-cache add ca-certificates wget
+
+# Create a non-root user and group to run the service (least privilege).
+RUN addgroup -S flowforge && adduser -S -G flowforge flowforge
 
 # Copy compiled binary and the schema file from builder
 COPY --from=builder /app/flowforge .
@@ -35,8 +38,17 @@ COPY --from=builder /app/scheduler .
 COPY --from=builder /app/recovery .
 COPY --from=builder /app/schema.sql .
 
+# Drop privileges.
+RUN chown -R flowforge:flowforge /app
+USER flowforge
+
 # Expose HTTP port
 EXPOSE 8080
+
+# Liveness healthcheck for the API service (overridden per-service in compose
+# where the process does not serve HTTP).
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD wget -q -O /dev/null http://localhost:8080/healthz || exit 1
 
 # Run the app
 CMD ["./flowforge"]
