@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aman0603/flowforge/internal/model"
+	"github.com/aman0603/flowforge/internal/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/scheduler"
 )
@@ -46,6 +47,7 @@ type Worker struct {
 	id                  string
 	repo                Repository
 	sched               scheduler.Client
+	recov               recovery.Client
 	executors           map[string]Executor
 	pollInterval        time.Duration
 	claimedStaleTimeout time.Duration
@@ -98,6 +100,7 @@ func New(
 	batchSize int,
 	shutdownGrace time.Duration,
 	sched scheduler.Client,
+	recov recovery.Client,
 ) *Worker {
 	if pollInterval <= 0 {
 		pollInterval = 1 * time.Second
@@ -143,6 +146,7 @@ func New(
 		id:                  id,
 		repo:                repo,
 		sched:               sched,
+		recov:               recov,
 		executors:           executors,
 		pollInterval:        pollInterval,
 		claimedStaleTimeout: claimedStaleTimeout,
@@ -310,7 +314,7 @@ func (w *Worker) runRecoveryIteration(ctx context.Context) {
 					}
 				}
 				if !hasLease {
-					recovered, err := w.repo.RecoverClaimedTask(ctx, tr.ID, tr.FencingToken)
+					recovered, err := w.recov.RecoverTask(ctx, tr.ID, "CLAIMED", tr.FencingToken)
 					if err != nil {
 						log.Printf("[worker-%s] ERROR recovering CLAIMED task %s: %v", w.id, tr.ID, err)
 					} else if recovered {
@@ -330,7 +334,7 @@ func (w *Worker) runRecoveryIteration(ctx context.Context) {
 					}
 				}
 				if !hasLease {
-					recovered, err := w.repo.RecoverRunningTask(ctx, tr.ID, tr.FencingToken)
+					recovered, err := w.recov.RecoverTask(ctx, tr.ID, "RUNNING", tr.FencingToken)
 					if err != nil {
 						log.Printf("[worker-%s] ERROR recovering RUNNING task %s: %v", w.id, tr.ID, err)
 					} else if recovered {

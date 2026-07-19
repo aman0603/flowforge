@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aman0603/flowforge/internal/model"
+	"github.com/aman0603/flowforge/internal/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/scheduler"
 )
@@ -249,11 +250,19 @@ func (fakeScheduler) PromoteRetries(context.Context) (int64, error) {
 	return 0, nil
 }
 
-// Ensure fakeScheduler satisfies the scheduler.Client interface.
+// fakeRecovery is a no-op recovery.Client for worker unit tests.
+type fakeRecovery struct{}
+
+func (fakeRecovery) RecoverTask(context.Context, string, string, int64) (bool, error) {
+	return false, nil
+}
+
+// Ensure fakeScheduler and fakeRecovery satisfy their interfaces.
 var _ scheduler.Client = fakeScheduler{}
+var _ recovery.Client = fakeRecovery{}
 
 func newTestWorker(id string, repo Repository, executors map[string]Executor, pollInterval time.Duration) *Worker {
-	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0, 1, 2, 1, 500*time.Millisecond, fakeScheduler{})
+	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0, 1, 2, 1, 500*time.Millisecond, fakeScheduler{}, fakeRecovery{})
 }
 
 type fakeExecutor struct {
@@ -597,6 +606,7 @@ func TestWorkerPoolConcurrencyAndPanics(t *testing.T) {
 			2, 4, 2, // poolSize=2, queueCapacity=4, batchSize=2
 			500*time.Millisecond,
 			fakeScheduler{},
+			fakeRecovery{},
 		)
 
 		err := w.Run(ctx)

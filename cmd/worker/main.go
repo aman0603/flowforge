@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aman0603/flowforge/internal/config"
+	"github.com/aman0603/flowforge/internal/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/scheduler"
 	"github.com/aman0603/flowforge/internal/worker"
@@ -97,6 +98,23 @@ func main() {
 		log.Printf("[worker-%s] Using local (in-process) scheduler", workerID)
 	}
 
+	// 5.7 Choose recovery client: gRPC when RECOVERY_ADDR is set, else local.
+	var recov recovery.Client
+	if cfg.RecoveryAddr != "" {
+		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		grpcRecov, err := recovery.NewGRPCClient(rctx, cfg.RecoveryAddr)
+		rcancel()
+		if err != nil {
+			log.Fatalf("[worker-%s] Failed to connect to recovery at %s: %v", workerID, cfg.RecoveryAddr, err)
+		}
+		defer grpcRecov.Close()
+		recov = grpcRecov
+		log.Printf("[worker-%s] Using remote recovery at %s", workerID, cfg.RecoveryAddr)
+	} else {
+		recov = recovery.NewLocalClient(repo)
+		log.Printf("[worker-%s] Using local (in-process) recovery", workerID)
+	}
+
 	// 6. Construct Worker
 	w := worker.New(
 		workerID,
@@ -116,6 +134,7 @@ func main() {
 		cfg.WorkerClaimBatchSize,
 		cfg.WorkerShutdownGrace,
 		sched,
+		recov,
 	)
 
 	// 6. Signal-aware context for Graceful Shutdown

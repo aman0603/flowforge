@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package flowforge.recovery;
+
+option go_package = "github.com/aman0603/flowforge/internal/proto/recovery;recovery";
+
+import "flowforge/common.proto";
+
+// RecoverTaskRequest asks the Recovery service to reclaim a single stale task.
+// The caller (Worker) is responsible for the Redis lease/worker-aliveness gate
+// before invoking this; the service performs the guarded, fencing-token-checked
+// database transition.
+message RecoverTaskRequest {
+  string task_run_id = 1;
+  int64 fencing_token = 2;
+  // task_status is the stale status observed by the caller ("CLAIMED"/"RUNNING").
+  string task_status = 3;
+}
+
+// RecoverTaskResponse reports whether the task was actually reclaimed.
+message RecoverTaskResponse {
+  bool reclaimed = 1;
+  flowforge.common.ErrorDetail error = 2;
+}
+
+// RecoverStaleTasksRequest triggers a full stale-task sweep on the Recovery
+// service. It is used when the Worker delegates the entire recovery loop.
+message RecoverStaleTasksRequest {
+  int64 claimed_timeout_ms = 1;
+  int64 running_timeout_ms = 2;
+}
+
+// RecoverStaleTasksResponse reports how many tasks were reclaimed.
+message RecoverStaleTasksResponse {
+  int64 claimed_recovered = 1;
+  int64 running_recovered = 2;
+  flowforge.common.ErrorDetail error = 3;
+}
+
+// RecoveryService owns lease-aware stale recovery and retry promotion. It does
+// NOT execute tasks. It is called synchronously by the Worker service over gRPC.
+service RecoveryService {
+  rpc RecoverTask(RecoverTaskRequest) returns (RecoverTaskResponse);
+  rpc RecoverStaleTasks(RecoverStaleTasksRequest) returns (RecoverStaleTasksResponse);
+}
