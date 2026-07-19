@@ -28,6 +28,31 @@ go run ./cmd/flowforge     # applies schema.sql on startup
 Bring up backing stores however you prefer (local installs or `docker compose up
 db redis kafka`), then run the other binaries as needed.
 
+Workers use in-process scheduler/recovery clients by default. Set
+`SCHEDULER_ADDR` / `RECOVERY_ADDR` to route through the standalone gRPC services
+instead.
+
+## Tests & Codegen
+
+```bash
+go test ./...             # unit tests
+go test -race ./...       # race detector
+gofmt -l . && go vet ./... # formatting + static analysis
+
+# integration tests (require a real Postgres)
+TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" \
+  go test -tags integration ./...
+
+# chaos / failure-injection tests (infra-free)
+go test -tags chaos ./internal/outbox/...
+
+# benchmarks
+go test -bench=. ./internal/dag/... ./internal/grpcutil/...
+
+# regenerate gRPC code after editing .proto files
+./scripts/gen-proto.sh    # requires protoc, protoc-gen-go, protoc-gen-go-grpc
+```
+
 ## Docker Compose
 
 The full stack is defined in `docker-compose.yml`:
@@ -49,6 +74,23 @@ Compose provides:
 
 Included observability: Prometheus (`:9090`), Grafana (`:3000`, admin/admin),
 Jaeger (`:16686`, OTLP `:4317`).
+
+**Exposed ports:**
+
+| Service | Port |
+|---|---|
+| API (HTTP) | `8080` |
+| Scheduler (gRPC) | `9091` → `9090` |
+| Recovery (gRPC) | `9092` → `9090` |
+| Prometheus | `9090` |
+| Grafana | `3000` (admin/admin) |
+| Jaeger UI | `16686` |
+| PostgreSQL | `5432` |
+| Redis | `6379` |
+| Kafka | `9092` |
+
+> `event-consumer` is a reference consumer and is not part of the compose stack;
+> run it manually against `KAFKA_BROKERS`.
 
 ## Container Image
 

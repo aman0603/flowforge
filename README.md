@@ -27,9 +27,8 @@ that only show up once work is distributed across processes.
 - [Repository Layout](#repository-layout)
 - [Installation](#installation)
 - [Local Development](#local-development)
-- [Docker Setup](#docker-setup)
-- [Running FlowForge](#running-flowforge)
 - [Example Workflow](#example-workflow)
+- [How Execution Works](#how-execution-works)
 - [API Overview](#api-overview)
 - [gRPC Overview](#grpc-overview)
 - [Kafka Overview](#kafka-overview)
@@ -235,81 +234,22 @@ go build ./...
 
 ## Local Development
 
-Common commands:
-
 ```bash
 go build ./...            # compile all packages/binaries
-go test ./...             # unit tests (fast; integration/chaos excluded)
-go test -race ./...       # race detector
-gofmt -l .                # formatting check
-go vet ./...              # static analysis
+go test ./...             # unit tests
 
-# Integration tests (require a real Postgres)
-TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" \
-  go test -tags integration ./...
-
-# Chaos / failure-injection tests (infra-free)
-go test -tags chaos ./internal/outbox/...
-
-# Benchmarks
-go test -bench=. ./internal/dag/... ./internal/grpcutil/...
-```
-
-Regenerate gRPC code after editing `.proto` files:
-
-```bash
-./scripts/gen-proto.sh    # requires protoc, protoc-gen-go, protoc-gen-go-grpc
-```
-
-## Docker Setup
-
-The full stack (Postgres, Redis, Kafka, all FlowForge services, Prometheus,
-Grafana, Jaeger) runs via Docker Compose:
-
-```bash
-cp .env.example .env       # set DB_URL, POSTGRES_*, secrets
+# run the full stack (Postgres, Redis, Kafka, all services, observability)
+cp .env.example .env
 docker compose up --build
+
+# or run individual processes against your own backing stores
+go run ./cmd/flowforge    # API on :8080, applies schema.sql on startup
+go run ./cmd/worker       # executes tasks
+go run ./cmd/publisher    # relays outbox → Kafka
 ```
 
-Scale stateless services:
-
-```bash
-docker compose up --build --scale worker=4 --scale publisher=2
-```
-
-**Exposed ports:**
-
-| Service | Port |
-|---|---|
-| API (HTTP) | `8080` |
-| Scheduler (gRPC) | `9091` → `9090` |
-| Recovery (gRPC) | `9092` → `9090` |
-| Prometheus | `9090` |
-| Grafana | `3000` (admin/admin) |
-| Jaeger UI | `16686` |
-| PostgreSQL | `5432` |
-| Redis | `6379` |
-| Kafka | `9092` |
-
-> `event-consumer` is a reference consumer and is not part of the compose stack;
-> run it manually against `KAFKA_BROKERS`.
-
-## Running FlowForge
-
-Each binary is a separate process. Locally without Docker, start the backing
-stores yourself, then run the API:
-
-```bash
-export DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"
-go run ./cmd/flowforge     # API on :8080, applies schema.sql on startup
-go run ./cmd/scheduler     # gRPC :9090
-go run ./cmd/recovery      # gRPC :9090
-go run ./cmd/worker        # executes tasks
-go run ./cmd/publisher     # relays outbox → Kafka
-```
-
-Workers run in-process (local) scheduler/recovery clients by default. Set
-`SCHEDULER_ADDR` / `RECOVERY_ADDR` to use the standalone gRPC services.
+More on integration/chaos tests, exposed ports, scaling, and the standalone
+gRPC services is in [docs/deployment.md](docs/deployment.md).
 
 ## Example Workflow
 
@@ -348,21 +288,57 @@ curl http://localhost:8080/api/v1/runs/<run-id>/history
 The built-in `SLEEP` executor is a reference implementation; add your own by
 implementing the `Executor` interface in `internal/worker/executor.go`.
 
+## How Execution Works
+
+A run flows from an HTTP call to durable state, then through the scheduler,
+workers, and the outbox to Kafka:
+
+```
+Client
+   │  POST /runs
+   ▼
+Create Run ─────► PostgreSQL   (root tasks -> READY, WorkflowStarted -> outbox)
+   │                  │
+   │                  ▼
+   │              Scheduler     (ClaimTasks: FOR UPDATE SKIP LOCKED, fencing++)
+   │                  │
+   │                  ▼
+   │               Worker       (acquire Redis lease, StartTaskRun)
+   │                  │
+   │                  ▼
+   │               Execute      (executor runs the task)
+   │                  │
+   │                  ▼
+   │           Persist Result   (MarkTaskRunCompleted, unlock children)
+   │                  │
+   │                  ▼
+   │                Outbox       (event written in the same transaction)
+   │                  │
+   │                  ▼
+   └──────────────► Kafka        (publisher relays, keyed by workflow_run_id)
+```
+
+The pieces a reviewer usually cares about:
+
+- **DAG execution** — dependencies gate readiness; completing a task unlocks its
+  children. Validation rejects cycles and missing dependencies up front.
+- **Scheduler** — hands out `READY` tasks via `FOR UPDATE SKIP LOCKED`, so many
+  workers claim concurrently without a distributed lock.
+- **Leasing** — a worker holds a renewable Redis lease while executing; losing
+  it cancels the work so nothing runs twice.
+- **Retries** — failures go to `RETRY_WAIT` with exponential backoff and are
+  promoted back to `READY` when due; exhausted tasks are dead-lettered.
+- **Recovery** — if a worker dies, its lease lapses and a recovery loop reclaims
+  the stale task, guarded by fencing tokens against zombie writes.
+
+See [docs/architecture.md](docs/architecture.md) for the full walkthrough and
+[docs/diagrams/](docs/diagrams/) for the sequence diagrams.
+
 ## API Overview
 
-The REST API is the external control plane. Full reference:
-[docs/api.md](docs/api.md).
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/v1/workflows` | Create a workflow definition |
-| `POST` | `/runs` | Start a workflow run |
-| `GET` | `/runs/{id}` | Run details + tasks |
-| `GET` | `/api/v1/runs/{run_id}/history` | Full run + attempt history |
-| `GET` | `/api/v1/tasks/{task_run_id}/attempts` | Attempts for a task |
-| `GET` | `/api/v1/dead-letter` | Dead-letter queue (paginated) |
-| `GET` | `/health`, `/healthz`, `/readyz` | Health / liveness / readiness |
-| `GET` | `/metrics` | Prometheus metrics |
+The REST API is the external control plane — create definitions, start runs, and
+query history and the dead-letter queue. Full endpoint reference, request/response
+examples, and error codes are in [docs/api.md](docs/api.md).
 
 ## gRPC Overview
 
