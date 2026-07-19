@@ -10,6 +10,7 @@ import (
 // Config holds the application configuration.
 type Config struct {
 	Port                    string
+	GRPCAddr                string
 	DBURL                   string
 	Env                     string
 	SchemaPath              string
@@ -103,6 +104,7 @@ func Load() *Config {
 
 	return &Config{
 		Port:                    getEnv("PORT", "8080"),
+		GRPCAddr:                getEnv("GRPC_ADDR", "0.0.0.0:9090"),
 		DBURL:                   getEnv("DB_URL", "postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"),
 		Env:                     getEnv("ENV", "development"),
 		SchemaPath:              getEnv("SCHEMA_PATH", "schema.sql"),

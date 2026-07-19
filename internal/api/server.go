@@ -12,7 +12,10 @@ import (
 
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/dag"
+	"github.com/aman0603/flowforge/internal/grpcutil"
 	"github.com/aman0603/flowforge/internal/model"
+	"github.com/aman0603/flowforge/internal/proto/common"
+	health "github.com/aman0603/flowforge/internal/proto/health"
 	"github.com/aman0603/flowforge/internal/repository"
 )
 
@@ -149,6 +152,18 @@ func (s *Server) Start(ctx context.Context) error {
 
 	log.Printf("Starting HTTP server on %s (env: %s)", addr, s.cfg.Env)
 
+	// Start the gRPC server on its own address, exposing internal RPC
+	// contracts (Phase 11) alongside the unchanged REST API.
+	grpcErrChan := make(chan error, 1)
+	grpcSrv := grpcutil.NewServer(s.cfg.GRPCAddr)
+	health.RegisterHealthServiceServer(grpcSrv.Server(), grpcutil.NewHealthServer(&apiHealthChecker{repo: s.repo}))
+	go func() {
+		log.Printf("Starting gRPC server on %s", s.cfg.GRPCAddr)
+		if err := grpcSrv.Start(); err != nil {
+			grpcErrChan <- err
+		}
+	}()
+
 	errChan := make(chan error, 1)
 
 	go func() {
@@ -160,12 +175,31 @@ func (s *Server) Start(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		log.Println("Shutting down HTTP server gracefully...")
+		grpcSrv.Stop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
+	case err := <-grpcErrChan:
+		return err
 	case err := <-errChan:
 		return err
 	}
+}
+
+// apiHealthChecker reports the API service's health based on database
+// connectivity. It implements grpcutil.HealthChecker.
+type apiHealthChecker struct {
+	repo *repository.Repository
+}
+
+// Status returns HEALTHY if the database can be pinged, otherwise UNHEALTHY.
+func (c *apiHealthChecker) Status(ctx context.Context, readiness bool) (common.ServiceStatus, string) {
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := c.repo.Ping(pingCtx); err != nil {
+		return common.ServiceStatus_SERVICE_STATUS_UNHEALTHY, fmt.Sprintf("database unreachable: %v", err)
+	}
+	return common.ServiceStatus_SERVICE_STATUS_HEALTHY, ""
 }
 
 // handleGetWorkflowRunHistory handles GET /api/v1/runs/{run_id}/history.

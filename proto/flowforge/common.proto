@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package flowforge.common;
+
+option go_package = "github.com/aman0603/flowforge/internal/proto/common;common";
+
+// ServiceStatus enumerates the lifecycle state reported by a service.
+enum ServiceStatus {
+  SERVICE_STATUS_UNSPECIFIED = 0;
+  SERVICE_STATUS_STARTING = 1;
+  SERVICE_STATUS_HEALTHY = 2;
+  SERVICE_STATUS_DEGRADED = 3;
+  SERVICE_STATUS_UNHEALTHY = 4;
+  SERVICE_STATUS_STOPPING = 5;
+}
+
+// ErrorCode classifies gRPC failures so clients can decide retryability.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_RETRYABLE = 1;
+  ERROR_CODE_PERMANENT = 2;
+  ERROR_CODE_VALIDATION = 3;
+  ERROR_CODE_INTERNAL = 4;
+  ERROR_CODE_UNAVAILABLE = 5;
+}
+
+// ErrorDetail carries a structured failure reason back to the caller.
+message ErrorDetail {
+  ErrorCode code = 1;
+  string message = 2;
+}

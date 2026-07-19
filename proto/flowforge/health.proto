@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package flowforge.health;
+
+option go_package = "github.com/aman0603/flowforge/internal/proto/health;health";
+
+import "flowforge/common.proto";
+
+// HealthRequest is sent by a client probing a service's liveness/readiness.
+message HealthRequest {
+  // When true the caller is asking for readiness (can serve traffic),
+  // otherwise liveness (process is up).
+  bool readiness = 1;
+}
+
+// HealthResponse reports the probed service state.
+message HealthResponse {
+  flowforge.common.ServiceStatus status = 1;
+  // Optional free-form detail (e.g. "redis unreachable").
+  string detail = 2;
+}
+
+// HealthService exposes liveness/readiness probes over gRPC. It is the first
+// synchronous internal contract established in Phase 11 and is safe for every
+// service to implement.
+service HealthService {
+  // Check returns the current health of the serving service.
+  rpc Check(HealthRequest) returns (HealthResponse);
+}

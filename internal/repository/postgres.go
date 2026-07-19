@@ -49,6 +49,11 @@ func (r *Repository) Close() error {
 	return r.db.Close()
 }
 
+// Ping verifies the database connection is alive.
+func (r *Repository) Ping(ctx context.Context) error {
+	return r.db.PingContext(ctx)
+}
+
 // InitializeSchema reads and runs the SQL schema file to provision the tables.
 func (r *Repository) InitializeSchema(schemaPath string) error {
 	file, err := os.Open(schemaPath)

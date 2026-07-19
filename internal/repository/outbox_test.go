@@ -447,3 +447,158 @@ func getOutboxEvents(t *testing.T, repo *Repository, workflowRunID string) []mod
 	}
 	return events
 }
+
+func TestClaimAndPublishOutboxEvents(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+
+	def := mustCreateDefinition(t, repo, "outbox-claim-wf")
+	run, err := repo.CreateWorkflowRun(ctx, def.ID, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	// Manually insert two pending outbox events via the same helper the repo uses.
+	insert := func(id, etype string, seq int64) {
+		_, err := repo.db.ExecContext(ctx, `
+			INSERT INTO outbox_events (id, event_type, event_version, aggregate_type, aggregate_id, workflow_run_id, sequence, payload, created_at, available_at)
+			VALUES ($1,$2,1,'workflow_run',$3,$4,$5,'{}'::jsonb,NOW(),NOW())
+		`, id, etype, run.ID, run.ID, seq)
+		if err != nil {
+			t.Fatalf("failed to seed outbox event: %v", err)
+		}
+	}
+	insert("aaaaaaaa-0000-0000-0000-000000000001", model.EventWorkflowStarted, 2)
+	insert("aaaaaaaa-0000-0000-0000-000000000002", model.EventTaskCompleted, 3)
+
+	publisherID := "test-publisher"
+	now := time.Now().UTC()
+
+	claimed, err := repo.ClaimPendingOutboxEvents(ctx, publisherID, 10, 30*time.Second, now)
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	// CreateWorkflowRun already inserted a WorkflowStarted event, plus our 2 seeds = 3.
+	if len(claimed) != 3 {
+		t.Fatalf("expected 3 claimed events, got %d", len(claimed))
+	}
+	for _, e := range claimed {
+		if e.LockedBy == nil || *e.LockedBy != publisherID {
+			t.Fatalf("expected event locked by %s, got %v", publisherID, e.LockedBy)
+		}
+	}
+
+	// A second claim by a different publisher must not reclaim the locked rows.
+	other, err := repo.ClaimPendingOutboxEvents(ctx, "other-publisher", 10, 30*time.Second, now)
+	if err != nil {
+		t.Fatalf("second claim failed: %v", err)
+	}
+	if len(other) != 0 {
+		t.Fatalf("expected 0 events for other publisher, got %d", len(other))
+	}
+
+	for _, e := range claimed {
+		if err := repo.MarkOutboxPublished(ctx, e.ID, publisherID, time.Now().UTC()); err != nil {
+			t.Fatalf("mark published failed: %v", err)
+		}
+	}
+
+	// After marking published, a new claim window returns nothing.
+	again, err := repo.ClaimPendingOutboxEvents(ctx, publisherID, 10, 30*time.Second, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("reclaim failed: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("expected no pending events after publish, got %d", len(again))
+	}
+}
+
+func TestExpiredClaimIsReclaimed(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+
+	def := mustCreateDefinition(t, repo, "outbox-expired-wf")
+	run, err := repo.CreateWorkflowRun(ctx, def.ID, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+	_, err = repo.db.ExecContext(ctx, `
+		INSERT INTO outbox_events (id, event_type, event_version, aggregate_type, aggregate_id, workflow_run_id, sequence, payload, created_at, available_at, locked_by, locked_until)
+		VALUES ('bbbbbbbb-0000-0000-0000-000000000001', 'WorkflowStarted', 1, 'workflow_run', $1, $1, 5, '{}'::jsonb, NOW(), NOW(), 'stale-pub', NOW() - INTERVAL '1 hour')
+	`, run.ID)
+	if err != nil {
+		t.Fatalf("failed to seed expired claim: %v", err)
+	}
+
+	reclaimed, err := repo.ClaimPendingOutboxEvents(ctx, "new-pub", 10, 30*time.Second, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("reclaim failed: %v", err)
+	}
+	// The initial WorkflowStarted event (unlocked) plus the expired claim = 2.
+	if len(reclaimed) != 2 {
+		t.Fatalf("expected 2 reclaimed events, got %d", len(reclaimed))
+	}
+	var foundExpired bool
+	for _, e := range reclaimed {
+		if e.ID == "bbbbbbbb-0000-0000-0000-000000000001" {
+			foundExpired = true
+			if e.LockedBy == nil || *e.LockedBy != "new-pub" {
+				t.Fatalf("expected expired event reclaimed by new-pub, got %v", e.LockedBy)
+			}
+		}
+	}
+	if !foundExpired {
+		t.Fatalf("expired claim event was not reclaimed")
+	}
+}
+
+func TestCleanupPublishedOutboxEvents(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+
+	def := mustCreateDefinition(t, repo, "outbox-cleanup-wf")
+	run, err := repo.CreateWorkflowRun(ctx, def.ID, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("failed to create run: %v", err)
+	}
+
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	recent := time.Now().UTC()
+	_, err = repo.db.ExecContext(ctx, `
+		INSERT INTO outbox_events (id, event_type, event_version, aggregate_type, aggregate_id, workflow_run_id, sequence, payload, created_at, available_at, published_at)
+		VALUES
+			('cccccccc-0000-0000-0000-000000000001', 'WorkflowStarted', 1, 'workflow_run', $1, $1, 7, '{}'::jsonb, NOW(), NOW(), $2),
+			('cccccccc-0000-0000-0000-000000000002', 'WorkflowCompleted', 1, 'workflow_run', $1, $1, 8, '{}'::jsonb, NOW(), NOW(), $3)
+	`, run.ID, old, recent)
+	if err != nil {
+		t.Fatalf("failed to seed published events: %v", err)
+	}
+
+	removed, err := repo.CleanupPublishedOutboxEvents(ctx, time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("expected 1 old published event removed, got %d", removed)
+	}
+
+	remaining, err := repo.ClaimPendingOutboxEvents(ctx, "pub", 10, 30*time.Second, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("post-cleanup claim failed: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("expected recent published event to remain (unclaimed), got %d", len(remaining))
+	}
+}
+
+func mustCreateDefinition(t *testing.T, repo *Repository, name string) *model.WorkflowDefinition {
+	def, err := repo.CreateWorkflowDefinition(context.Background(), &model.CreateDefinitionRequest{
+		Name:        name,
+		Description: "outbox test",
+		Tasks:       []model.TaskDefinitionInput{},
+	})
+	if err != nil {
+		t.Fatalf("failed to create definition: %v", err)
+	}
+	return def
+}
