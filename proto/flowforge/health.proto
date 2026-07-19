@@ -20,9 +20,8 @@ message HealthResponse {
   string detail = 2;
 }
 
-// HealthService exposes liveness/readiness probes over gRPC. It is the first
-// synchronous internal contract established in Phase 11 and is safe for every
-// service to implement.
+// HealthService exposes liveness/readiness probes over gRPC. It is a
+// synchronous internal contract that is safe for every service to implement.
 service HealthService {
   // Check returns the current health of the serving service.
   rpc Check(HealthRequest) returns (HealthResponse);

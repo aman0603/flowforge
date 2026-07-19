@@ -1,547 +1,416 @@
 # FlowForge
 
-FlowForge is a distributed, high-performance workflow execution engine written in Go. It enables clients to register Directed Acyclic Graph (DAG) workflows and execute eligible tasks concurrently across multiple distributed worker nodes.
+**A distributed, DAG-based workflow orchestration engine written in Go.**
 
-PostgreSQL is the durable source of truth for execution states, while Redis is utilized for ephemeral liveness coordination, heartbeats, and renewable task execution leases.
+FlowForge executes workflows defined as directed acyclic graphs (DAGs) of tasks
+across a horizontally scalable fleet of stateless workers. It provides durable
+state, exactly-effectively-once execution semantics, at-least-once event
+delivery, crash recovery, retries with backoff, dead-letter handling, and
+first-class observability.
 
----
-
-## Architecture Diagram (Current Phase 11 Status)
-
-```mermaid
-graph TD
-    Client[Client / User] -->|HTTP/REST| API[API Server]
-    API -->|Validate DAG| DAG[DAG Validator]
-    API -->|Transactional Write| DB[(PostgreSQL)]
-
-    Sched[Scheduler gRPC Service] -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| DB
-    Recov[Recovery gRPC Service] -->|Stale Task Reset| DB
-
-    DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W1[Worker 1]
-    DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W2[Worker 2]
-
-    W1 -->|gRPC ClaimTasks / PromoteRetries| Sched
-    W2 -->|gRPC ClaimTasks / PromoteRetries| Sched
-    W1 -->|gRPC RecoverTask| Recov
-    W2 -->|gRPC RecoverTask| Recov
-
-    W1 <-->|Heartbeats & Leases| Redis[(Redis)]
-    W2 <-->|Heartbeats & Leases| Redis
-
-    subgraph Worker Pool Architecture
-        direction TB
-        W1 -->|Buffered Channel| WP1[Worker Goroutines 1..N]
-        W2 -->|Buffered Channel| WP2[Worker Goroutines 1..N]
-    end
-
-    subgraph Event Streaming (Transactional Outbox)
-        direction TB
-        DB -->|outbox_events insert in same tx| OB[(outbox_events)]
-        OB -->|claim FOR UPDATE SKIP LOCKED| PUB[Publisher]
-        PUB -->|async publish| KAFKA[(Kafka)]
-        KAFKA -->|consumer groups| CON[Consumers]
-    end
-```
+> **Status:** v1.0 — feature complete, with production hardening, security, and
+> operational documentation in place.
 
 ---
 
-## Directory Layout
+## Table of Contents
 
-* **`cmd/flowforge/`**: Entry point of the application containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/flowforge/main.go), bootstrapping the database and the HTTP server.
-* **`cmd/worker/`**: Entry point of the worker process containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/worker/main.go).
-* **`cmd/scheduler/`**: Standalone gRPC Scheduler service (ClaimTasks / PromoteRetries). Workers use it when `SCHEDULER_ADDR` is set; otherwise they call the scheduler in-process.
-* **`cmd/recovery/`**: Standalone gRPC Recovery service (RecoverTask for stale-task reset). Workers use it when `RECOVERY_ADDR` is set; otherwise they recover in-process.
-* **`cmd/publisher/`**: Standalone outbox publisher process that relays committed `outbox_events` rows to Kafka.
-* **`internal/outbox/`**: Outbox publisher and Kafka producer adapter.
-* **`internal/api/`**: The web service layers containing [server.go](file:///home/amanpaswan/aman/flowforge/internal/api/server.go), implementing routes using Go's native HTTP muxer and handling requests/responses.
-* **`internal/config/`**: Configuration loading in [config.go](file:///home/amanpaswan/aman/flowforge/internal/config/config.go) using environment variables.
-* **`internal/dag/`**: Core graph validation logic in [dag.go](file:///home/amanpaswan/aman/flowforge/internal/dag/dag.go) to detect circular dependencies before persisting workflows.
-* **`internal/model/`**: Shared Go structs, constants, and API structures in [model.go](file:///home/amanpaswan/aman/flowforge/internal/model/model.go).
-* **`internal/repository/`**: PostgreSQL database connector and transaction boundaries implemented in [postgres.go](file:///home/amanpaswan/aman/flowforge/internal/repository/postgres.go).
-* **`internal/worker/`**: Worker process logic, execution loop, lease coordinator, and executors.
-* **`schema.sql`**: Relational database schema layout [schema.sql](file:///home/amanpaswan/aman/flowforge/schema.sql).
-
----
-
-## REST API Reference
-
-All requests and responses use JSON format.
-
-### 1. Health Check
-* **Endpoint:** `GET /health`
-* **Response Status:** `200 OK`
-* **Response Body:**
-  ```json
-  {
-    "status": "ok"
-  }
-  ```
-
-### 2. Register Workflow Definition
-Registers a new workflow template and validates that its tasks form a valid Directed Acyclic Graph (DAG) with no cycles.
-* **Endpoint:** `POST /api/v1/workflows`
-* **Request Body:**
-  ```json
-  {
-    "name": "etl-pipeline",
-    "description": "Simple ETL Workflow",
-    "tasks": [
-      {
-        "name": "fetch-data",
-        "task_type": "HTTP",
-        "config": {"url": "https://api.example.com/data"},
-        "max_retries": 3,
-        "retry_backoff_ms": 1000,
-        "timeout_ms": 5000,
-        "dependencies": []
-      },
-      {
-        "name": "process-data",
-        "task_type": "SCRIPT",
-        "config": {"script": "process.py"},
-        "max_retries": 2,
-        "retry_backoff_ms": 2000,
-        "timeout_ms": 10000,
-        "dependencies": ["fetch-data"]
-      }
-    ]
-  }
-  ```
-* **Response Status:** `201 Created`
-* **Response Body:**
-  ```json
-  {
-    "id": "e0b0db73-c603-4ab6-8809-72b1574044ee",
-    "name": "etl-pipeline",
-    "description": "Simple ETL Workflow",
-    "created_at": "2026-07-12T15:32:00Z"
-  }
-  ```
-
-### 3. Trigger Workflow Run
-Instantiates a new execution tracking run for a registered workflow definition, pre-populating task runs.
-* **Endpoint:** `POST /runs`
-* **Request Body:**
-  ```json
-  {
-    "workflow_definition_id": "e0b0db73-c603-4ab6-8809-72b1574044ee",
-    "input": {
-      "batch_id": "1234"
-    }
-  }
-  ```
-* **Response Status:** `201 Created`
-* **Response Body:**
-  ```json
-  {
-    "id": "7809930f-b258-45a8-9d29-a1b7ad4f71a0",
-    "workflow_definition_id": "e0b0db73-c603-4ab6-8809-72b1574044ee",
-    "status": "PENDING",
-    "input": {
-      "batch_id": "1234"
-    },
-    "output": {}
-  }
-  ```
-
-### 4. Fetch Workflow Run Progress
-Queries the execution progress and state of all task runs for a given workflow run.
-* **Endpoint:** `GET /runs/{id}`
-* **Response Status:** `200 OK`
-* **Response Body:**
-  ```json
-  {
-    "run": {
-      "id": "7809930f-b258-45a8-9d29-a1b7ad4f71a0",
-      "workflow_definition_id": "e0b0db73-c603-4ab6-8809-72b1574044ee",
-      "status": "PENDING",
-      "input": {"batch_id": "1234"},
-      "output": {},
-      "created_at": "2026-07-12T15:32:05Z"
-    },
-    "tasks": [
-      {
-        "id": "f5d0d1b3-4632-475f-9fe3-c6722d3b25bb",
-        "workflow_run_id": "7809930f-b258-45a8-9d29-a1b7ad4f71a0",
-        "task_definition_id": "908bd2f1-6780-4965-b1a9-3d12f293cf3d",
-        "status": "PENDING",
-        "attempts": 0,
-        "input": {},
-        "output": {},
-        "created_at": "2026-07-12T15:32:05Z"
-      }
-    ]
-  }
-  ```
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Technology Stack](#technology-stack)
+- [Repository Layout](#repository-layout)
+- [Installation](#installation)
+- [Local Development](#local-development)
+- [Docker Setup](#docker-setup)
+- [Running FlowForge](#running-flowforge)
+- [Example Workflow](#example-workflow)
+- [API Overview](#api-overview)
+- [gRPC Overview](#grpc-overview)
+- [Kafka Overview](#kafka-overview)
+- [Configuration](#configuration)
+- [Observability](#observability)
+- [Benchmarks](#benchmarks)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
-## Phase 11: gRPC-Based Internal Service Communication
+## Overview
 
-The scheduling and recovery responsibilities previously run in-process inside every worker are now available as standalone gRPC services (`cmd/scheduler`, `cmd/recovery`). Workers call them over gRPC when their addresses are configured; otherwise they fall back to the original in-process behavior, so existing deployments are unchanged until opted in.
+A **workflow** in FlowForge is a definition consisting of tasks and their
+dependencies. When a workflow is instantiated as a **run**, tasks with no
+unmet dependencies become `READY`, are claimed by workers, executed, and — on
+completion — unlock their dependents. Every state transition is persisted to
+PostgreSQL (the single source of truth) and emitted as an event through a
+transactional outbox to Kafka for downstream consumers.
 
-* **Scheduler service** exposes `ClaimTasks` and `PromoteRetries`. When `SCHEDULER_ADDR` is set, a worker dials this service instead of touching PostgreSQL directly for claiming/promotion.
-* **Recovery service** exposes `RecoverTask`. When `RECOVERY_ADDR` is set, a worker delegates the stale-task DB transition to this service while keeping the Redis lease gate local.
-* **Transport**: insecure (plaintext) gRPC is used for internal network traffic. Each service also exposes the gRPC Health protocol; the gRPC client applies per-attempt deadlines, exponential backoff on retryable codes (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `DEADLINE_EXCEEDED`, `ABORTED`, `INTERNAL`), and maps server errors to the `common.ErrorCode` contract.
-* **Opt-in config**: `SCHEDULER_ADDR`, `RECOVERY_ADDR`, `GRPC_RETRY_MAX_ATTEMPTS`, `GRPC_RETRY_BASE_DELAY`, `GRPC_REQUEST_TIMEOUT`.
+Design goals:
 
-The `docker-compose.yml` now defines `scheduler` (port `9091:9090`) and `recovery` (port `9092:9090`) services and points the `worker` at them via `SCHEDULER_ADDR=scheduler:9090` and `RECOVERY_ADDR=recovery:9090`. Protobuf definitions live in `proto/flowforge/` and regenerate via `scripts/gen-proto.sh`.
+- **Durability** — no task or event is lost across crashes.
+- **Horizontal scalability** — every component is stateless and scales out.
+- **Correctness under failure** — leasing, fencing tokens, and lease-aware
+  recovery prevent double execution and lost work.
+- **Observability** — structured logs, Prometheus metrics, and OpenTelemetry
+  traces across HTTP, gRPC, and Kafka boundaries.
 
----
+## Features
 
-## Phase 12: Observability & Production Operations
+- **DAG workflows** with dependency resolution and cycle detection.
+- **Durable state machine** for workflow runs and task runs in PostgreSQL.
+- **Concurrent worker pools** with bounded, backpressure-aware task claiming
+  (`FOR UPDATE SKIP LOCKED`).
+- **Distributed leasing** via Redis with fencing tokens and heartbeats.
+- **Lease-aware crash recovery** — stale `CLAIMED`/`RUNNING` tasks are safely
+  reclaimed by a recovery service.
+- **Retries with exponential backoff** and a **dead-letter queue** for
+  permanently failed tasks.
+- **Transactional outbox → Kafka** for at-least-once event delivery with
+  per-workflow ordering.
+- **gRPC internal services** (scheduler, recovery, health) with optional
+  TLS/mTLS.
+- **Full observability** — Prometheus metrics, OTLP tracing (Jaeger), JSON logs.
+- **Production hardening** — connection pooling, HTTP timeouts, rate limiting,
+  request body limits, non-root containers, health/readiness probes.
 
-Every FlowForge service is instrumented through a single shared package
-(`internal/telemetry`) that wires OpenTelemetry tracing, Prometheus metrics, and
-structured JSON logging. Observability is **opt-in for tracing** and never
-changes business behavior — when `OTEL_DISABLED=true` (the default) the tracer is
-a no-op while metrics and logs still work.
+## Architecture
 
-### Metrics
+FlowForge runs as a set of independent, horizontally scalable processes sharing
+three backing stores with clear ownership boundaries:
 
-Each binary exposes a Prometheus scrape endpoint at `/metrics` on `METRICS_ADDR`
-(default `:9091`). Key instruments:
-
-| Metric | Type | Meaning |
-|---|---|---|
-| `flowforge_http_requests_total` | counter | HTTP requests by method/path/status |
-| `flowforge_http_request_duration_seconds` | histogram | HTTP latency |
-| `flowforge_grpc_requests_total` | counter | gRPC calls by method/code |
-| `flowforge_grpc_request_duration_seconds` | histogram | gRPC latency |
-| `flowforge_tasks_claimed/started/completed/failed/timed_out_total` | counter | worker task lifecycle |
-| `flowforge_worker_queue_depth` | gauge | queued vs active executions |
-| `flowforge_tasks_recovered_total` | counter | stale tasks reclaimed |
-| `flowforge_outbox_published/failed/retried/cleaned_total` | counter | publisher throughput |
-
-### Tracing
-
-A trace flows **HTTP → gRPC → Kafka** via W3C TraceContext propagation. The HTTP
-middleware opens a server span and mints/propagates an `X-Request-ID`
-correlation ID; the gRPC client interceptor injects trace context and the
-correlation ID into metadata; the Kafka publisher injects them into message
-headers, and the event-consumer extracts them to continue the trace. Set
-`OTEL_DISABLED=false` and `OTEL_EXPORTER_OTLP_ENDPOINT` (default `localhost:4317`)
-to export spans to Jaeger.
-
-### Structured logging
-
-Logs are JSON via `zap`, tagged with `service` and (where available)
-`worker_id`, `trace_id`, `span_id`, and `request_id`. Database URLs are redacted
-before logging and task payloads are never logged.
-
-### Health endpoints
-
-* `GET /health` — legacy always-200 check.
-* `GET /healthz` — liveness (process up).
-* `GET /readyz` — readiness; returns `503` until PostgreSQL is reachable.
-* gRPC services expose the standard gRPC Health protocol (DB-backed checker).
-
-### Observability stack
-
-`docker compose up` also starts **Prometheus** (`:9090`), **Grafana** (`:3000`,
-admin/admin, with a provisioned "FlowForge Overview" dashboard), and **Jaeger**
-(`:16686`). Deploy assets live under `deploy/`:
+| Store | Owns |
+|---|---|
+| **PostgreSQL** | Durable workflow/task state; transactional outbox (source of truth) |
+| **Redis** | Ephemeral coordination — worker heartbeats, task leases |
+| **Kafka** | Asynchronous event stream (workflow lifecycle events) |
 
 ```
-deploy/prometheus/prometheus.yml   # scrape config for all services
-deploy/prometheus/alerts.yml       # availability/failure/latency alert rules
-deploy/grafana/provisioning/       # datasource + dashboard providers
-deploy/grafana/dashboards/         # FlowForge Overview dashboard JSON
+                 ┌────────────┐
+  clients ─────► │  API (REST)│  create workflows / runs, query status
+                 └─────┬──────┘
+                       │ writes state + outbox (same TX)
+                       ▼
+                 ┌────────────┐        ┌───────────────┐
+                 │ PostgreSQL │◄──────►│  Scheduler    │ (gRPC) claim / promote
+                 │  (truth)   │        └───────────────┘
+                 └─────┬──────┘        ┌───────────────┐
+                       ▲               │  Recovery     │ (gRPC) reclaim stale
+             leases /  │               └───────────────┘
+             heartbeats│  ┌────────────┐
+                 ┌─────┴──┐│  Workers   │ claim → execute → persist
+                 │ Redis  ││ (stateless)│
+                 └────────┘└─────┬──────┘
+                                 │ state change emits outbox row
+                                 ▼
+                 ┌────────────┐ poll+publish ┌────────┐   ┌───────────┐
+                 │ Publisher  │─────────────►│ Kafka  │──►│ Consumers │
+                 └────────────┘              └────────┘   └───────────┘
+
+  Telemetry: every process → Prometheus (metrics) + Jaeger (OTLP traces)
 ```
 
-### Observability config
+**Boundary invariants** (validated in [docs/architecture.md](docs/architecture.md)):
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `OTEL_DISABLED` | `true` | disable tracing (no-op tracer) |
-| `OTEL_SERVICE_NAME` | `flowforge` | service name on spans/resources |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` | OTLP/gRPC collector (Jaeger) |
-| `METRICS_ADDR` | `:9091` | Prometheus `/metrics` listen address |
-| `LOG_LEVEL` | `info` | zap log level |
+- REST owns **external** APIs; gRPC owns **synchronous internal** communication.
+- Kafka owns **asynchronous** events; Redis owns **ephemeral** coordination;
+  PostgreSQL owns **durable** state.
+- Workers are stateless. The **publisher never mutates** workflow state. The
+  **scheduler and recovery services never execute** tasks.
 
----
+See [docs/architecture.md](docs/architecture.md) and
+[docs/diagrams/](docs/diagrams/) for full diagrams.
 
-## How to Run & Build
+## Technology Stack
 
-### Using Docker (Recommended)
-We use Docker Compose to manage PostgreSQL, Redis, Kafka, the API server, workers, and the outbox publisher.
+| Concern | Technology |
+|---|---|
+| Language | Go 1.26 |
+| Durable store | PostgreSQL 16 (`github.com/lib/pq`) |
+| Coordination | Redis 7 (`github.com/redis/go-redis/v9`) |
+| Event streaming | Kafka (`github.com/segmentio/kafka-go`) |
+| Internal RPC | gRPC + Protobuf (`google.golang.org/grpc`) |
+| Metrics | Prometheus (`client_golang`) via OpenTelemetry |
+| Tracing | OpenTelemetry → OTLP → Jaeger |
+| Logging | Zap (structured JSON) |
+| Packaging | Docker, Docker Compose |
+
+## Repository Layout
+
+```
+flowforge/
+├── cmd/                    # Entrypoints (one binary per process)
+│   ├── flowforge/          #   REST API / control plane
+│   ├── worker/             #   Task execution engine
+│   ├── scheduler/          #   gRPC claim + retry-promotion service
+│   ├── recovery/           #   gRPC stale-task recovery service
+│   ├── publisher/          #   Transactional outbox → Kafka relay
+│   └── event-consumer/     #   Reference idempotent Kafka consumer
+├── internal/
+│   ├── api/                # HTTP server, handlers, routing
+│   ├── config/             # Env-driven configuration + validation
+│   ├── dag/                # DAG validation + cycle detection
+│   ├── grpcutil/           # gRPC server/client, TLS, retry, health
+│   ├── model/              # Domain models + event envelopes
+│   ├── outbox/             # Outbox publisher + Kafka producer
+│   ├── proto/              # Generated protobuf/gRPC code
+│   ├── recovery/           # Recovery service (local + gRPC)
+│   ├── repository/         # PostgreSQL repository (all SQL)
+│   ├── scheduler/          # Scheduler service (local + gRPC)
+│   ├── telemetry/          # Metrics, tracing, logging, middleware
+│   └── worker/             # Worker pool, coordinator, executors
+├── proto/flowforge/        # .proto contracts (common/health/scheduler/recovery)
+├── deploy/                 # Prometheus + Grafana provisioning
+├── docs/                   # Documentation (this audit)
+├── scripts/                # loadtest.sh, gen-proto.sh
+├── schema.sql              # Database schema (applied on startup)
+├── docker-compose.yml      # Full local stack
+└── Dockerfile              # Multi-stage, non-root image
+```
+
+## Installation
+
+**Prerequisites:** Go 1.26+, Docker + Docker Compose (for the full stack).
 
 ```bash
-# Start all containers in the foreground with 3 concurrent workers and 2 publishers
-docker compose up --build --scale worker=3 --scale publisher=2
-
-# Shutdown and clean volumes
-docker compose down -v
+git clone https://github.com/aman0603/flowforge.git
+cd flowforge
+go mod download
+go build ./...
 ```
 
-The `publisher` service runs as a standalone process. It polls the
-`outbox_events` table, publishes committed workflow events to Kafka, and marks
-them published. It does not embed into workers and never requires Redis. Kafka
-outages do not block workflow execution; pending events are retried on the next
-poll. Multiple publisher replicas are safe because claims use `FOR UPDATE SKIP
-LOCKED` with a per-instance lease.
+## Local Development
 
-### Running Locally (Without Docker)
-Make sure you have running PostgreSQL and Redis instances, and specify configuration via environment variables:
+Common commands:
 
 ```bash
-# Set configuration variables
+go build ./...            # compile all packages/binaries
+go test ./...             # unit tests (fast; integration/chaos excluded)
+go test -race ./...       # race detector
+gofmt -l .                # formatting check
+go vet ./...              # static analysis
+
+# Integration tests (require a real Postgres)
+TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" \
+  go test -tags integration ./...
+
+# Chaos / failure-injection tests (infra-free)
+go test -tags chaos ./internal/outbox/...
+
+# Benchmarks
+go test -bench=. ./internal/dag/... ./internal/grpcutil/...
+```
+
+Regenerate gRPC code after editing `.proto` files:
+
+```bash
+./scripts/gen-proto.sh    # requires protoc, protoc-gen-go, protoc-gen-go-grpc
+```
+
+## Docker Setup
+
+The full stack (Postgres, Redis, Kafka, all FlowForge services, Prometheus,
+Grafana, Jaeger) runs via Docker Compose:
+
+```bash
+cp .env.example .env       # set DB_URL, POSTGRES_*, secrets
+docker compose up --build
+```
+
+Scale stateless services:
+
+```bash
+docker compose up --build --scale worker=4 --scale publisher=2
+```
+
+**Exposed ports:**
+
+| Service | Port |
+|---|---|
+| API (HTTP) | `8080` |
+| Scheduler (gRPC) | `9091` → `9090` |
+| Recovery (gRPC) | `9092` → `9090` |
+| Prometheus | `9090` |
+| Grafana | `3000` (admin/admin) |
+| Jaeger UI | `16686` |
+| PostgreSQL | `5432` |
+| Redis | `6379` |
+| Kafka | `9092` |
+
+> `event-consumer` is a reference consumer and is not part of the compose stack;
+> run it manually against `KAFKA_BROKERS`.
+
+## Running FlowForge
+
+Each binary is a separate process. Locally without Docker, start the backing
+stores yourself, then run the API:
+
+```bash
 export DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"
-export REDIS_ADDR="localhost:6379"
-export PORT="8080"
-export SCHEMA_PATH="schema.sql"
-
-# Kafka & Outbox configurations
-export KAFKA_BROKERS="localhost:9092"
-export KAFKA_TOPIC="flowforge.workflow-events.v1"
-export KAFKA_CLIENT_ID="flowforge-publisher"
-export OUTBOX_POLL_INTERVAL="500ms"
-export OUTBOX_BATCH_SIZE="100"
-export OUTBOX_CLAIM_TIMEOUT="30s"
-export OUTBOX_MAX_RETRIES="5"
-export OUTBOX_RETRY_BASE_DELAY="1s"
-export OUTBOX_RETENTION="24h"
-
-# gRPC internal services (optional; omit to keep scheduler/recovery in-process)
-export SCHEDULER_ADDR="localhost:9091"
-export RECOVERY_ADDR="localhost:9092"
-export GRPC_RETRY_MAX_ATTEMPTS="3"
-export GRPC_RETRY_BASE_DELAY="50ms"
-export GRPC_REQUEST_TIMEOUT="5s"
-
-# Run the server
-go run cmd/flowforge/main.go
-
-# Start a worker process locally
-export WORKER_ID="local-worker-1"
-go run cmd/worker/main.go
+go run ./cmd/flowforge     # API on :8080, applies schema.sql on startup
+go run ./cmd/scheduler     # gRPC :9090
+go run ./cmd/recovery      # gRPC :9090
+go run ./cmd/worker        # executes tasks
+go run ./cmd/publisher     # relays outbox → Kafka
 ```
 
----
+Workers run in-process (local) scheduler/recovery clients by default. Set
+`SCHEDULER_ADDR` / `RECOVERY_ADDR` to use the standalone gRPC services.
+
+## Example Workflow
+
+**1. Create a workflow definition** (a two-task DAG: `build` → `deploy`):
+
+```bash
+curl -X POST http://localhost:8080/api/v1/workflows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "ci-pipeline",
+    "description": "build then deploy",
+    "tasks": [
+      { "name": "build",  "task_type": "SLEEP", "config": {"duration_ms": 500}, "max_retries": 3 },
+      { "name": "deploy", "task_type": "SLEEP", "config": {"duration_ms": 200}, "dependencies": ["build"] }
+    ]
+  }'
+# → 201 { "id": "<definition-id>", ... }
+```
+
+**2. Start a run:**
+
+```bash
+curl -X POST http://localhost:8080/runs \
+  -H 'Content-Type: application/json' \
+  -d '{ "workflow_definition_id": "<definition-id>", "input": {} }'
+# → 201 { "id": "<run-id>", "status": "PENDING", ... }
+```
+
+**3. Inspect progress:**
+
+```bash
+curl http://localhost:8080/runs/<run-id>
+curl http://localhost:8080/api/v1/runs/<run-id>/history
+```
+
+The built-in `SLEEP` executor is a reference implementation; add your own by
+implementing the `Executor` interface in `internal/worker/executor.go`.
+
+## API Overview
+
+The REST API is the external control plane. Full reference:
+[docs/api.md](docs/api.md).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/workflows` | Create a workflow definition |
+| `POST` | `/runs` | Start a workflow run |
+| `GET` | `/runs/{id}` | Run details + tasks |
+| `GET` | `/api/v1/runs/{run_id}/history` | Full run + attempt history |
+| `GET` | `/api/v1/tasks/{task_run_id}/attempts` | Attempts for a task |
+| `GET` | `/api/v1/dead-letter` | Dead-letter queue (paginated) |
+| `GET` | `/health`, `/healthz`, `/readyz` | Health / liveness / readiness |
+| `GET` | `/metrics` | Prometheus metrics |
+
+## gRPC Overview
+
+Internal synchronous communication uses gRPC (all RPCs unary). Full reference:
+[docs/grpc.md](docs/grpc.md).
+
+- **`SchedulerService`** — `ClaimTasks`, `PromoteRetries`
+- **`RecoveryService`** — `RecoverTask`, `RecoverStaleTasks`
+- **`HealthService`** — `Check` (liveness/readiness)
+
+Contracts live in [`proto/flowforge/`](proto/flowforge/). TLS/mTLS is
+configurable via `GRPC_TLS_*` (disabled by default).
+
+## Kafka Overview
+
+Workflow lifecycle events are delivered through a **transactional outbox**:
+state changes and their events are committed in the same PostgreSQL transaction,
+then the `publisher` relays them to Kafka at-least-once. Events are keyed by
+`workflow_run_id` for per-workflow ordering.
+
+Event types include `WorkflowStarted`, `WorkflowCompleted`, `WorkflowFailed`,
+`TaskStarted`, `TaskCompleted`, `TaskFailed`, `TaskTimedOut`, `RetryScheduled`,
+`RetryExhausted`, `DLQCreated`, `TaskRecovered`, `RetryPromoted`.
+
+`cmd/event-consumer` is a reference **idempotent** consumer: it dedupes by event
+ID, commits offsets only after processing, and skips malformed envelopes.
+
+## Configuration
+
+All configuration is via environment variables with production-safe defaults;
+every hardening feature is **off by default**. See [.env.example](.env.example)
+and the full reference in
+[docs/production/CONFIGURATION.md](docs/production/CONFIGURATION.md).
+
+Key groups: core (`PORT`, `DB_URL`, `ENV`), connection pool (`DB_MAX_OPEN_CONNS`
+…), worker/outbox tuning, Kafka/Redis, security (`GRPC_TLS_*`, `RATE_LIMIT_*`,
+`MAX_REQUEST_BODY_BYTES`), and observability (`OTEL_*`, `PPROF_ENABLED`).
+
+## Observability
+
+- **Metrics** — Prometheus on `METRICS_ADDR` (`:9091/metrics`) for every
+  process. Dashboards provisioned in Grafana (`deploy/grafana/`).
+- **Tracing** — OpenTelemetry → OTLP → Jaeger (enable with
+  `OTEL_DISABLED=false`). Trace context propagates across HTTP, gRPC, and Kafka.
+- **Logging** — structured JSON via Zap, with correlation IDs (`X-Request-ID`).
+
+Alerting rules live in `deploy/prometheus/alerts.yml`. See
+[docs/operations.md](docs/operations.md).
+
+## Benchmarks
+
+Go benchmarks cover DAG validation (`BenchmarkValidateChain`,
+`BenchmarkValidateWide`) and gRPC retry backoff (`BenchmarkNextBackoff`). A
+system-level load-test helper is provided in `scripts/loadtest.sh`.
+
+```bash
+go test -bench=. -benchmem ./internal/dag/... ./internal/grpcutil/...
+```
+
+See [docs/benchmarking.md](docs/benchmarking.md) for methodology and how to
+capture results.
 
 ## Testing
 
-Execute the test suites using the following commands:
+Layered test suite (see [docs/testing.md](docs/testing.md)):
 
-```bash
-# Run unit tests
-go test -v ./...
+- **Unit** — default `go test ./...` (no external dependencies).
+- **Integration** — `-tags integration`, requires `TEST_DB_URL` (real Postgres).
+- **Chaos** — `-tags chaos`, infra-free failure injection.
+- **Benchmarks** — `go test -bench`.
 
-# Run unit tests with Go's race detector enabled
-go test -race ./...
+## Documentation
 
-# Run integration tests against a running PostgreSQL test database
-TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" go test -tags=integration -v ./internal/repository
+| Doc | Purpose |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | System architecture + boundaries |
+| [docs/api.md](docs/api.md) | REST API reference |
+| [docs/grpc.md](docs/grpc.md) | gRPC service reference |
+| [docs/deployment.md](docs/deployment.md) | Deployment guide |
+| [docs/operations.md](docs/operations.md) | Operations runbook |
+| [docs/benchmarking.md](docs/benchmarking.md) | Benchmark report |
+| [docs/testing.md](docs/testing.md) | Test coverage report |
+| [docs/release.md](docs/release.md) | Release checklist + audit findings |
+| [docs/diagrams/](docs/diagrams/) | Architecture + sequence diagrams |
+| [docs/adr/](docs/adr/) | Architecture Decision Records |
+| [docs/production/](docs/production/README.md) | Production runbooks |
 
-# Run integration tests with Go's race detector enabled
-TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" go test -tags=integration -race -v ./internal/repository
-```
+## Contributing
 
----
+1. Fork and create a feature branch.
+2. Follow existing code style; run `gofmt -l .`, `go vet ./...`, and
+   `go test ./...` before submitting.
+3. Add tests for new behavior. Keep changes focused.
+4. Regenerate protobuf via `./scripts/gen-proto.sh` if you touch `.proto` files.
+5. Open a pull request describing the change and its rationale.
 
-## Concurrency & Execution Semantics
+See [CONTRIBUTING](docs/release.md#contributing) notes and the Definition of
+Done in `AGENT.md`.
 
-### 1. Multi-Worker Task Distribution
-FlowForge utilizes PostgreSQL `FOR UPDATE SKIP LOCKED` inside a transaction within `ClaimNextReadyTask`. This allows multiple workers to claim ready tasks concurrently without conflicts or double-claiming. 
+## License
 
-### 2. Workflow-Level Lock Serialization
-To ensure DAG progression correctness (such as Diamond DAG sibling completion race conditions), all transitions affecting workflow progression (`MarkTaskRunCompleted` and `MarkTaskRunFailed`) exclusively lock the parent `workflow_runs` row:
-```sql
-SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE
-```
-This forces all completion/failure transactions for the same workflow to serialize, keeping sibling completions completely safe and deterministic.
-
-### 3. Worker Ownership Fencing & Monotonic Fencing Tokens
-Workers acquire tasks and stamp their unique `worker_id` (generated via container hostname and UUID). Additionally, each task claim atomically increments a monotonic `fencing_token` on the task run in PostgreSQL. All subsequent authoritative task mutations (`StartTaskRun`, `MarkTaskRunCompleted`, `MarkTaskRunFailed`) are guarded by checking:
-```sql
-WHERE worker_id = $workerID AND fencing_token = $fencingToken AND status = $expectedStatus
-```
-This prevents hijacked execution, split-brain transitions, or late-arriving writes from stale workers.
-
-### 4. Ephemeral Redis Coordination & Renewable Leases
-While PostgreSQL owns the durable workflow correctness, Redis acts as the ephemeral coordination layer.
-* **Worker Liveness:** Workers register their presence via a TTL-backed heartbeat key (`flowforge:worker:{worker_id}:heartbeat`) in Redis. A background loop refreshes this heartbeat periodically. If a worker process crashes, its heartbeat key naturally expires.
-* **Task Leases:** Upon claiming a task, the worker acquires a lease key (`flowforge:task:{task_run_id}:lease`) in Redis. The worker periodically renews this lease during active execution.
-* **Context Interruption:** If a worker fails to renew its lease (due to network partition or Redis failure), it immediately cancels the executing task's context and aborts writing terminal results to PostgreSQL.
-
-### 5. Lease-Aware Stale Task Crash Recovery
-Workers run a background context-aware stale-task recovery loop.
-* **Stale CLAIMED Reset:** Tasks stuck in `CLAIMED` status longer than `CLAIMED_STALE_TIMEOUT` (default `30s`) are reset back to `READY` if no active lease exists or the lease owner has died.
-* **Stale RUNNING Reset:** Tasks stuck in `RUNNING` status longer than `RUNNING_STALE_TIMEOUT` (default `5m`) are reset back to `READY` (clearing `worker_id`, `claimed_at`, `started_at`, and resetting execution-result fields) if no active lease exists or the lease owner has died.
-* **Attempt Orphaning:** Stale running resets transition the corresponding active attempt record in `task_attempts` to `ORPHANED`.
-
-### 6. Automatic Retries and Exponential Backoff
-When task execution fails or times out, and its execution `attempts <= max_retries`, FlowForge schedules a retry:
-* The task status transitions to `RETRY_WAIT`.
-* The parent workflow run remains `RUNNING`, and all downstream child tasks remain blocked in `PENDING`.
-* Next execution time is computed using exponential backoff: `delay = base_backoff * 2^(attempts-1)`, capped at 1 hour and bounded to prevent numeric overflow.
-* Once the backoff delay has elapsed, the background recovery routine promotes the task back to `READY`.
-
-### 7. Priority-Based Scheduling Preference
-Task execution selection prioritizes tasks with higher priority values:
-* Claiming queries select `READY` tasks ordered by `priority DESC` and then `created_at ASC` (FIFO tie-breaking).
-* Priority is a scheduling preference; already CLAIMED or RUNNING tasks are not preempted.
-* Priority does not bypass DAG dependencies (downstream dependent tasks remain blocked until all parents succeed).
-
-### 8. Task Execution Timeouts
-Workers enforce execution-level context timeouts based on the task's `timeout_ms` definition:
-* A timeout triggers context cancellation (`context.DeadlineExceeded`) on the executing task.
-* On timeout, the task consumes a retry attempt and transitions to `RETRY_WAIT` (if budget remains) or to terminal `TIMED_OUT` (if retry budget is exhausted).
-* Worker process graceful shutdown cancellations (`context.Canceled`) are distinguished from task execution timeouts, leaving the task in `RUNNING` for normal stale task recovery without consuming attempts.
-
-### 9. Durable Attempt History
-FlowForge records details of every individual execution attempt of a task in the `task_attempts` table.
-* **Attempt Semantics:** Each `StartTaskRun` transaction atomically increments the task run's `attempts` count and inserts a corresponding `task_attempts` record with an incremented `attempt_number` and `RUNNING` status.
-* **Attempt Statuses:**
-  * `RUNNING`: The attempt is currently executing.
-  * `COMPLETED`: The attempt completed successfully.
-  * `FAILED`: The attempt failed with a normal execution error.
-  * `TIMED_OUT`: The attempt exceeded its execution timeout limit.
-  * `ORPHANED`: The worker process crashed or became slow, causing stale recovery to reclaim the task.
-* **Failure Classification:**
-  * `EXECUTION_ERROR`: Set on normal task execution failures.
-  * `TIMEOUT`: Set when the execution timeout is exceeded.
-  * `WORKER_LOST`: Set on `ORPHANED` attempts when the worker disappears.
-
-### 10. Dead-Letter Queue (DLQ)
-When a task run reaches an unrecoverable terminal execution state due to retry exhaustion (normal failures or timeouts), FlowForge writes a durable record to `dead_letter_tasks` in the same transaction as the task run terminal status update.
-* **Dead-letter conditions:** Tasks are only dead-lettered when they transition to terminal `FAILED` or `TIMED_OUT` states (i.e. retry budget exhausted).
-* **Uniqueness:** A unique index on `task_run_id` prevents duplicate DLQ records.
-* **Replay Support:** Replay is not automatically supported in Phase 7; it is deferred to future design.
-
-### 11. HTTP History & Observability APIs
-FlowForge provides REST endpoints to inspect execution history and terminal failures:
-* `GET /api/v1/runs/{run_id}/history`: Returns the complete history of a workflow run, including all its tasks and attempts.
-* `GET /api/v1/tasks/{task_run_id}/attempts`: Returns attempts for a task run ordered by `attempt_number ASC`.
-* `GET /api/v1/dead-letter`: Returns the paginated list of dead-lettered tasks.
-  * **Pagination:** Query parameters `limit` (default 50, max 100) and `offset` are validated and enforced.
-
-### 12. Delivery Semantics & Crash Windows
-> [!IMPORTANT]
-> **FlowForge provides at-least-once execution semantics.**
-> Recovering a stale `RUNNING` task resets it back to `READY` to allow re-claiming and re-execution, and marks the failed attempt as `ORPHANED`. Fencing tokens prevent stale workers from committing authoritative FlowForge task results, but cannot undo an external side effect that occurred before lease loss, process failure, or stale-write rejection. Therefore, task executors that perform external side effects must be designed to be idempotent.
-
-* **Crash Windows and Duplicate Execution:**
-  * *Window A (Duplicate Side Effects):* Executor completes external side effects -> Worker crashes before `COMPLETED` is persisted -> Stale recovery reclaims task and marks attempt `ORPHANED` -> Task runs again. (Idempotency required).
-  * *Window B (Stale Running Reclamation):* Worker starts execution -> Worker crashes -> Stale recovery transitions task to `READY` and attempt to `ORPHANED` -> Re-execution creates attempt 2.
-  * *Window C (Claimed Reclamation):* Worker crashes while task is `CLAIMED` before `StartTaskRun` -> Stale recovery transitions task to `READY` -> No attempt record is created (attempts count remains unchanged).
-  * *Window D (Terminal Transaction Crash):* Worker crashes mid-transaction when persisting terminal failure -> Database transaction rolls back completely (no partial terminal state or orphaned DLQ).
-
-### 13. Payload and Payload Size Limitations
-* **Large Payloads:** Task output (`output` JSONB) and error messages (`error_message` text) are stored in the database. Very large payloads can result in high memory consumption and latency. Object storage integration is deferred to future phases.
-* **Unbounded History:** Attempt history and DLQ logs grow indefinitely without an automatic retention service.
-
-### 14. API Security
-* APIs are currently unauthenticated. Production deployment requires external authentication proxies or gateways.
-
-### 15. Supported Executor Types
-* **`SLEEP`**: Basic executor that sleeps for the duration configured in `duration_ms`.
-
-### 16. Known Limitations
-* Object storage integration for large payloads is deferred to future phases.
-
-### 17. High-Performance Worker Pools, Concurrency Bounds, & Graceful Shutdown
-Phase 9 introduces high-performance concurrent worker pools, bounded capacity-aware task claiming, and resilient graceful shutdown:
-* **Worker Pool Execution:** A worker process spawns a fixed set of concurrent execution goroutines bounded by `WORKER_POOL_SIZE`. These routines consume tasks from a shared, in-memory buffered queue channel (`WORKER_QUEUE_CAPACITY`).
-* **Capacity-Aware Backpressure:** The worker scheduler loop dynamically monitors slot availability:
-  `available_slots = WORKER_POOL_SIZE - active_executions - queued_tasks`
-  If `available_slots > 0`, it claims a batch of tasks up to the minimum of `available_slots` and `WORKER_CLAIM_BATCH_SIZE`. If capacity is fully saturated, claiming is paused, preventing memory overload.
-* **Atomic Batch Claiming:** Ready tasks are claimed in batches using a single database transaction query utilizing a Common Table Expression (CTE). This ensures `FOR UPDATE SKIP LOCKED`, priority ranking, and FIFO tie-breaking are executed atomically.
-* **Panic Isolation:** Executor runtime panics are intercepted using Go's `recover()`, recorded as execution failures with a stack trace in the task attempt details, and isolated to prevent cascading crashes.
-* **Graceful Shutdown Drainage:** On context termination, the scheduler loop halts task claiming. The worker drains all queued tasks, transactionally returning them to `READY` status in PostgreSQL, while active executions are given up to `WORKER_SHUTDOWN_GRACE_PERIOD_MS` to finish execution. Context deadline cancellation terminates any tasks exceeding this grace period.
-
----
-
-## Event Streaming & Outbox Operations (Phase 10)
-
-FlowForge publishes committed workflow events to Kafka using the transactional
-outbox pattern. PostgreSQL remains the durable source of truth; Kafka is only an
-asynchronous distribution channel.
-
-### Event flow
-
-```text
-Workflow State Change
-  -> Single PostgreSQL Transaction (state + outbox insert)
-  -> COMMIT
-  -> Publisher claims row (FOR UPDATE SKIP LOCKED, renewable lease)
-  -> Publisher writes to Kafka OUTSIDE the transaction
-  -> Publisher marks row published (conditional on claim token)
-```
-
-### Topic & ordering
-
-* Topic: `flowforge.workflow-events.v1` (configurable via `KAFKA_TOPIC`).
-* Message key: `workflow_run_id`, so events for a given run preserve order.
-* Each event carries a per-workflow monotonic `sequence`.
-
-### Delivery semantics
-
-* **At-least-once:** a crash between Kafka acknowledgement and the published
-  mark produces a duplicate. Consumers must be idempotent (dedupe by `event_id`).
-* Kafka outages never block workflow execution; events stay pending and are
-  retried on the next poll.
-* Publication failures reschedule the event with exponential backoff
-  (`OUTBOX_RETRY_BASE_DELAY`, capped at `OUTBOX_MAX_RETRIES`).
-
-### Configuration
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker list |
-| `KAFKA_TOPIC` | `flowforge.workflow-events.v1` | Target topic |
-| `KAFKA_CLIENT_ID` | `flowforge-publisher` | Publisher/consumer-group ID |
-| `OUTBOX_POLL_INTERVAL` | `500ms` | Publisher poll cadence |
-| `OUTBOX_BATCH_SIZE` | `100` | Max events claimed per poll |
-| `OUTBOX_CLAIM_TIMEOUT` | `30s` | Lease duration for a claimed event |
-| `OUTBOX_MAX_RETRIES` | `5` | Retries before extended backoff |
-| `OUTBOX_RETRY_BASE_DELAY` | `1s` | Base exponential backoff |
-| `OUTBOX_RETENTION` | `24h` | Published-event retention before cleanup |
-
-### Running the publisher
-
-The publisher is a standalone process (`cmd/publisher`). In Docker Compose it
-runs as the `publisher` service; scale it independently:
-
-```bash
-docker compose up --build --scale publisher=2
-```
-
-### Consumer example
-
-`cmd/event-consumer` is a reference idempotent consumer. It subscribes via a
-consumer group, parses the versioned envelope, deduplicates by `event_id`,
-commits offsets only after processing, and safely skips malformed or unknown
-events.
-
-### Observability
-
-The publisher logs a metrics snapshot every 30s:
-`published`, `failed`, `retried`, `cleaned`. Watch `failed` and the outbox
-backlog (`published_at IS NULL` row count) to detect Kafka or publisher issues.
-
----
-
-## Phase 13: Production Hardening & Scalability
-
-Production operations documentation lives in [`docs/production/`](docs/production/README.md).
-All hardening features (DB pool tuning, pprof, gRPC TLS/mTLS, HTTP rate limiting,
-request body limits) ship **off by default** — behavior is unchanged unless
-explicitly enabled.
-
-* **[Production Readiness Checklist](docs/production/PRODUCTION-READINESS-CHECKLIST.md)** — go/no-go gate.
-* **[Configuration Reference](docs/production/CONFIGURATION.md)** — all environment variables.
-* **[Deployment Guide](docs/production/DEPLOYMENT.md)** — build, image, rollout, health probes.
-* **[Operations Runbook](docs/production/OPERATIONS.md)** — monitoring, alerts, incidents.
-* **[Troubleshooting](docs/production/TROUBLESHOOTING.md)** — symptom-oriented fixes.
-* **[Scaling Guide](docs/production/SCALING.md)** — horizontal scaling & DB connection budget.
-* **[Performance](docs/production/PERFORMANCE.md)** — benchmarks, pprof, load testing.
-* **[Security](docs/production/SECURITY.md)** — TLS/mTLS, rate limits, secrets.
-* **[Resilience & Chaos](docs/production/CHAOS.md)** — failure model + chaos suite (`go test -tags chaos ./...`).
-* **[Backup & DR](docs/production/BACKUP-RECOVERY.md)** — backups and disaster recovery.
-
-The container image runs as a **non-root** user with a built-in `HEALTHCHECK`,
-and `docker-compose.yml` sets restart policies, resource limits, and per-service
-healthchecks.
-
-
+See [LICENSE](LICENSE). *(No license file is currently present in the
+repository — add one before public release; see
+[docs/release.md](docs/release.md).)*

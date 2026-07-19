@@ -1,23 +1,10 @@
-# AGENTS.md
+# AGENT.md
 
 ## Project Overview
 
 FlowForge is a distributed workflow execution engine written in Go. Clients submit DAG-based workflows through REST APIs, and multiple workers execute eligible tasks concurrently.
 
-## Phase Planning Workflow
-
-Before changing code, review the current phase-planning folder under `docs/phases/` and its `STATUS.md`. Treat the implementation as authoritative when planning differs from code.
-
-For the active phase:
-
-1. Read its `PLAN.md` and `STATUS.md` before taking action.
-2. Preserve completed architecture and invariants unless the task explicitly changes them.
-3. Implement only the next unfinished loop unless the user asks for broader work.
-4. Run relevant checks before marking a loop complete.
-5. Update `STATUS.md` after each completed loop, including what remains.
-6. Record material deviations from the plan in the phase folder.
-
-Current phase plan: `docs/phases/phase-13-production-hardening/`
+When planning changes, treat the implementation as authoritative and preserve existing architecture and invariants unless the task explicitly changes them.
 
 ### Tech Stack
 

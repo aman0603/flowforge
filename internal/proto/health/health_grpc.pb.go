@@ -26,9 +26,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// HealthService exposes liveness/readiness probes over gRPC. It is the first
-// synchronous internal contract established in Phase 11 and is safe for every
-// service to implement.
+// HealthService exposes liveness/readiness probes over gRPC. It is a
+// synchronous internal contract that is safe for every service to implement.
 type HealthServiceClient interface {
 	// Check returns the current health of the serving service.
 	Check(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
@@ -56,9 +55,8 @@ func (c *healthServiceClient) Check(ctx context.Context, in *HealthRequest, opts
 // All implementations must embed UnimplementedHealthServiceServer
 // for forward compatibility.
 //
-// HealthService exposes liveness/readiness probes over gRPC. It is the first
-// synchronous internal contract established in Phase 11 and is safe for every
-// service to implement.
+// HealthService exposes liveness/readiness probes over gRPC. It is a
+// synchronous internal contract that is safe for every service to implement.
 type HealthServiceServer interface {
 	// Check returns the current health of the serving service.
 	Check(context.Context, *HealthRequest) (*HealthResponse, error)

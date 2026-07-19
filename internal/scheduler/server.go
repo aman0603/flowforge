@@ -10,7 +10,7 @@ import (
 
 // GRPCServer implements the generated SchedulerService interface using the
 // repository. It owns only claiming and retry promotion; it never executes
-// tasks. A standalone process (cmd/scheduler) hosts it in Loop 4.
+// tasks. A standalone process (cmd/scheduler) hosts it.
 type GRPCServer struct {
 	pbsched.UnimplementedSchedulerServiceServer
 	repo *repository.Repository

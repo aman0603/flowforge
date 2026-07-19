@@ -1,5 +1,5 @@
 // Package grpcmw provides gRPC server interceptors for FlowForge services:
-// metrics and (in later loops) tracing and correlation propagation.
+// metrics, tracing, and correlation propagation.
 package grpcmw
 
 import (

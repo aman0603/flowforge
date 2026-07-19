@@ -1,4 +1,33 @@
-# Local phase planning artifacts (kept on disk, not tracked)
+# --- Local phase planning artifacts (kept on disk, not tracked) ---
 docs/phases/
+docs/adr
+docs/production
 PLANNER.md
-AGENTS.md
+
+# --- Compiled binaries (built from cmd/*, should not be committed) ---
+/flowforge
+/worker
+/publisher
+/scheduler
+/recovery
+/event-consumer
+
+# --- Go build / test / profiling output ---
+*.test
+*.out
+coverage.*
+*.prof
+*.pprof
+
+# --- Local environment / secrets (.env.example IS tracked) ---
+.env
+.env.*
+!.env.example
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS junk ---
+.DS_Store

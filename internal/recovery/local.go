@@ -11,8 +11,8 @@ import (
 // Client abstracts the recovery operations the Worker depends on. Two
 // implementations exist: a local one backed directly by the repository (the
 // modular monolith default) and a gRPC one calling a standalone Recovery
-// service. This seam lets Phase 11 extract recovery without changing the
-// worker's lease-aware reclaim logic.
+// service. This seam lets recovery run either in-process or as a standalone
+// service without changing the worker's lease-aware reclaim logic.
 type Client interface {
 	// RecoverTask reclaims a single stale task, dispatching on its observed
 	// status ("CLAIMED" or "RUNNING"), using the provided fencing token. It
@@ -20,8 +20,8 @@ type Client interface {
 	RecoverTask(ctx context.Context, taskRunID string, status string, fencingToken int64) (bool, error)
 }
 
-// LocalClient implements Client using the repository directly, preserving
-// pre-Phase-11 in-process behavior when no gRPC recovery service is configured.
+// LocalClient implements Client using the repository directly, providing
+// in-process behavior when no gRPC recovery service is configured.
 type LocalClient struct {
 	repo *repository.Repository
 }

@@ -218,7 +218,7 @@ func (s *Server) Start(ctx context.Context) error {
 	log.Printf("Starting HTTP server on %s (env: %s)", addr, s.cfg.Env)
 
 	// Start the gRPC server on its own address, exposing internal RPC
-	// contracts (Phase 11) alongside the unchanged REST API.
+	// contracts alongside the REST API.
 	grpcErrChan := make(chan error, 1)
 	grpcSrv, err := grpcutil.NewServerTLS(s.cfg.GRPCAddr, grpcutil.TLSConfig{
 		Enabled:  s.cfg.GRPCTLSEnabled,

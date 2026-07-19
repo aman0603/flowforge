@@ -11,7 +11,7 @@ import (
 
 // GRPCServer implements the generated RecoveryService interface using the
 // repository. It owns only guarded reclaim transitions; it never executes
-// tasks. A standalone process (cmd/recovery) hosts it in Loop 4.
+// tasks. A standalone process (cmd/recovery) hosts it.
 type GRPCServer struct {
 	pbrecov.UnimplementedRecoveryServiceServer
 	repo *repository.Repository

@@ -1,5 +1,5 @@
 // Package httpmw provides HTTP middleware for FlowForge services: metrics,
-// correlation IDs, and (in later loops) tracing and structured access logs.
+// correlation IDs, tracing, and structured access logs.
 package httpmw
 
 import (
