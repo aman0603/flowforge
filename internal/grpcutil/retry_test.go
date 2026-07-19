@@ -96,10 +96,10 @@ func TestErrorCodeFromStatus(t *testing.T) {
 	}{
 		{status.Error(codes.InvalidArgument, "x"), int32(3)}, // ERROR_CODE_VALIDATION
 		{status.Error(codes.Unavailable, "x"), int32(1)},     // ERROR_CODE_RETRYABLE
-		{status.Error(codes.NotFound, "x"), int32(2)},       // ERROR_CODE_PERMANENT
-		{status.Error(codes.Internal, "x"), int32(4)},       // ERROR_CODE_INTERNAL
-		{nil, int32(0)},                                      // UNSPECIFIED
-		{errors.New("plain"), int32(4)},                      // ERROR_CODE_INTERNAL
+		{status.Error(codes.NotFound, "x"), int32(2)},        // ERROR_CODE_PERMANENT
+		{status.Error(codes.Internal, "x"), int32(4)},        // ERROR_CODE_INTERNAL
+		{nil, int32(0)},                 // UNSPECIFIED
+		{errors.New("plain"), int32(4)}, // ERROR_CODE_INTERNAL
 	}
 	for _, c := range cases {
 		if got := int32(ErrorCodeFromStatus(c.err)); got != c.want {

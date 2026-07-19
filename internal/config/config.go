@@ -33,6 +33,11 @@ type Config struct {
 	GRPCRetryMaxAttempts    int
 	GRPCRetryBaseDelay      time.Duration
 	GRPCRequestTimeout      time.Duration
+	OTelDisabled            bool
+	OTelServiceName         string
+	OTelExporterEndpoint    string
+	MetricsAddr             string
+	LogLevel                string
 	OutboxPollInterval      time.Duration
 	OutboxBatchSize         int
 	OutboxClaimTimeout      time.Duration
@@ -122,6 +127,15 @@ func Load() *Config {
 		grpcRequestTimeout = 5 * time.Second
 	}
 
+	otelDisabled := getEnv("OTEL_DISABLED", "true") == "true"
+	otelServiceName := getEnv("OTEL_SERVICE_NAME", "")
+	if otelServiceName == "" {
+		otelServiceName = "flowforge"
+	}
+	otelExporterEndpoint := getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
+	metricsAddr := getEnv("METRICS_ADDR", ":9091")
+	logLevel := getEnv("LOG_LEVEL", "info")
+
 	return &Config{
 		Port:                    getEnv("PORT", "8080"),
 		GRPCAddr:                getEnv("GRPC_ADDR", "0.0.0.0:9090"),
@@ -147,6 +161,11 @@ func Load() *Config {
 		GRPCRetryMaxAttempts:    grpcRetryMaxAttempts,
 		GRPCRetryBaseDelay:      grpcRetryBaseDelay,
 		GRPCRequestTimeout:      grpcRequestTimeout,
+		OTelDisabled:            otelDisabled,
+		OTelServiceName:         otelServiceName,
+		OTelExporterEndpoint:    otelExporterEndpoint,
+		MetricsAddr:             metricsAddr,
+		LogLevel:                logLevel,
 		OutboxPollInterval:      pollInterval,
 		OutboxBatchSize:         batchSizeOutbox,
 		OutboxClaimTimeout:      claimTimeout,
