@@ -1,9 +1,12 @@
-# Retry & Recovery Sequences
+# Retry & Dead-Letter Flow
 
-Focused view of retry, dead-lettering, and crash recovery. Full set in
-[sequences.md](sequences.md).
+How failed tasks are retried with backoff, and what happens when retries run out.
 
 ## Retry with backoff
+
+A failed task is not retried inline. It transitions to `RETRY_WAIT` with a
+future `next_retry_at`, and the scheduler promotes it back to `READY` once the
+backoff has elapsed. This keeps workers free instead of blocking on `sleep`.
 
 ```mermaid
 sequenceDiagram
@@ -14,29 +17,33 @@ sequenceDiagram
   W->>DB: MarkTaskRunFailed
   alt attempts < max_retries
     note over DB: RETRY_WAIT; next_retry_at = now + exp backoff (cap 1h);<br/>emit RetryScheduled
-    S->>DB: PromoteDueRetries -> READY (emit RetryPromoted)
+    S->>DB: PromoteDueRetries (RETRY_WAIT -> READY where next_retry_at <= now)
+    note over DB: emit RetryPromoted
   else attempts == max_retries
-    note over DB: DLQ row; workflow FAILED;<br/>emit RetryExhausted + DLQCreated
+    note over DB: insert dead_letter_tasks row; task terminal FAILED;<br/>workflow FAILED; emit RetryExhausted + DLQCreated
   end
 ```
 
-## Crash recovery
+## Dead-letter queue
+
+When a task exhausts its retries it is written to `dead_letter_tasks` and the
+workflow is marked `FAILED`. The DLQ is queryable through the API for
+inspection.
 
 ```mermaid
 sequenceDiagram
-  participant RL as Recovery loop
-  participant R as Redis
-  participant Rec as RecoveryService
+  participant P as Worker
   participant DB as PostgreSQL
+  participant API
+  participant C as Operator
 
-  RL->>DB: GetActiveTaskRuns
-  RL->>R: lease owner alive?
-  alt owner dead / no lease
-    RL->>Rec: RecoverTask(fencing_token, status)
-    Rec->>DB: reset READY; attempt ORPHANED (WORKER_LOST); TaskRecovered
-  end
+  P->>DB: MarkTaskRunFailed (attempts == max_retries)
+  note over DB: insert dead_letter_tasks row;<br/>task terminal FAILED; workflow FAILED;<br/>emit RetryExhausted + DLQCreated
+  C->>API: GET /api/v1/dead-letter?limit&offset
+  API->>DB: GetDeadLetterTasks(limit, offset)
+  DB-->>API: []DeadLetterTask
+  API-->>C: 200 OK
 ```
 
-See also: [Retry](sequences.md#4-retry),
-[Worker Crash Recovery](sequences.md#6-worker-crash-recovery),
-[DLQ Flow](sequences.md#7-dlq-flow).
+See also: [recovery.md](recovery.md) for crash recovery (a different failure
+mode — the task never *failed*, its worker disappeared).

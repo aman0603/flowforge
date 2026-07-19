@@ -1,20 +1,25 @@
 # FlowForge
 
-**A distributed, DAG-based workflow orchestration engine written in Go.**
+**A distributed, DAG-based workflow engine written in Go.**
 
-FlowForge executes workflows defined as directed acyclic graphs (DAGs) of tasks
-across a horizontally scalable fleet of stateless workers. It provides durable
-state, exactly-effectively-once execution semantics, at-least-once event
-delivery, crash recovery, retries with backoff, dead-letter handling, and
-first-class observability.
+FlowForge runs workflows defined as directed acyclic graphs (DAGs) of tasks
+across a pool of stateless workers. Task and workflow state lives in PostgreSQL,
+workers coordinate through Redis leases, and lifecycle events are published to
+Kafka via a transactional outbox. It handles crash recovery, retries with
+backoff, dead-letter handling, and ships with metrics, tracing, and structured
+logs.
 
-> **Status:** v1.0 — feature complete, with production hardening, security, and
-> operational documentation in place.
+I built FlowForge to explore how a real workflow engine holds together — the
+kind of correctness problems (double execution, lost events, partial failure)
+that only show up once work is distributed across processes.
 
 ---
 
 ## Table of Contents
 
+- [Why FlowForge?](#why-flowforge)
+- [Design Principles](#design-principles)
+- [Non-Goals](#non-goals)
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture](#architecture)
@@ -30,13 +35,65 @@ first-class observability.
 - [Kafka Overview](#kafka-overview)
 - [Configuration](#configuration)
 - [Observability](#observability)
-- [Benchmarks](#benchmarks)
 - [Testing](#testing)
+- [Failure Handling](#failure-handling)
+- [Distributed Systems Concepts Demonstrated](#distributed-systems-concepts-demonstrated)
 - [Documentation](#documentation)
-- [Contributing](#contributing)
-- [License](#license)
+- [Future Improvements](#future-improvements)
 
 ---
+
+## Why FlowForge?
+
+Workflow engines look simple from the outside: run a graph of tasks in
+dependency order. The hard parts are all in the failure modes:
+
+- A worker claims a task, then crashes mid-execution. Who reclaims it, and how do
+  you stop the original worker from finishing later and corrupting state?
+- A task and its "completed" event must both be recorded, or neither. How do you
+  avoid publishing an event for a database change that rolled back?
+- Two workers poll for work at the same instant. How do you guarantee only one
+  runs a given task?
+
+FlowForge is my attempt to answer those questions with a design that leans on
+established patterns — database-backed queues with `SELECT ... FOR UPDATE SKIP
+LOCKED`, fencing tokens for lease safety, and the transactional outbox pattern —
+rather than hand-rolled coordination. It is a learning project first, but the
+correctness properties are real and tested.
+
+## Design Principles
+
+- **PostgreSQL is the source of truth.** Redis and Kafka are supporting
+  infrastructure; if either is wiped, the system can be rebuilt from Postgres.
+  Correctness never depends on Redis being available.
+- **Assume at-least-once, design for idempotency.** Nothing assumes
+  exactly-once delivery or execution. Consumers dedupe by event ID; task
+  transitions are guarded so a replayed action is a no-op.
+- **Claiming is a database operation.** Task claiming uses `FOR UPDATE SKIP
+  LOCKED` so concurrent workers can safely pull work without distributed locks
+  in the hot path. Redis leases handle liveness, not correctness.
+- **Fencing tokens over trust.** Every lease carries a monotonic token; a stale
+  worker that wakes up after its lease expired cannot complete a task that has
+  been reclaimed.
+- **Stateless processes.** Workers, the scheduler, recovery, and the publisher
+  hold no durable in-memory state, so any of them can be scaled or restarted.
+- **Clear ownership per transport.** REST for external clients, gRPC for
+  internal synchronous calls, Kafka for async events. Each boundary has one job.
+
+## Non-Goals
+
+FlowForge deliberately does **not** try to be:
+
+- **A general-purpose task queue.** It models DAGs with dependencies, not
+  fire-and-forget jobs.
+- **A multi-tenant SaaS platform.** There is no authentication, authorization,
+  or tenant isolation built in — it expects to run behind a trusted boundary.
+- **A sandbox for arbitrary code.** Executors are compiled into the worker
+  binary; there is no dynamic code loading or untrusted-payload execution.
+- **A drop-in replacement for Temporal, Airflow, or Argo.** It shares ideas with
+  them but is intentionally smaller in scope.
+- **Kubernetes-native.** The reference deployment is Docker Compose; running on
+  an orchestrator is possible but not provided.
 
 ## Overview
 
@@ -47,14 +104,8 @@ completion — unlock their dependents. Every state transition is persisted to
 PostgreSQL (the single source of truth) and emitted as an event through a
 transactional outbox to Kafka for downstream consumers.
 
-Design goals:
-
-- **Durability** — no task or event is lost across crashes.
-- **Horizontal scalability** — every component is stateless and scales out.
-- **Correctness under failure** — leasing, fencing tokens, and lease-aware
-  recovery prevent double execution and lost work.
-- **Observability** — structured logs, Prometheus metrics, and OpenTelemetry
-  traces across HTTP, gRPC, and Kafka boundaries.
+See [Design Principles](#design-principles) for the reasoning behind these
+choices.
 
 ## Features
 
@@ -65,15 +116,17 @@ Design goals:
 - **Distributed leasing** via Redis with fencing tokens and heartbeats.
 - **Lease-aware crash recovery** — stale `CLAIMED`/`RUNNING` tasks are safely
   reclaimed by a recovery service.
-- **Retries with exponential backoff** and a **dead-letter queue** for
-  permanently failed tasks.
-- **Transactional outbox → Kafka** for at-least-once event delivery with
-  per-workflow ordering.
+- **Retries with exponential backoff** and a **dead-letter queue** for tasks
+  that exhaust their retries.
+- **Transactional outbox → Kafka** for at-least-once event delivery, keyed by
+  workflow run for per-workflow ordering.
 - **gRPC internal services** (scheduler, recovery, health) with optional
   TLS/mTLS.
-- **Full observability** — Prometheus metrics, OTLP tracing (Jaeger), JSON logs.
-- **Production hardening** — connection pooling, HTTP timeouts, rate limiting,
-  request body limits, non-root containers, health/readiness probes.
+- **Observability** — Prometheus metrics, OpenTelemetry tracing (Jaeger), and
+  structured logs.
+- **Operational guards** — connection pooling, HTTP timeouts, opt-in rate
+  limiting and request body limits, non-root containers, and health/readiness
+  probes (all off by default).
 
 ## Architecture
 
@@ -162,7 +215,7 @@ flowforge/
 │   └── worker/             # Worker pool, coordinator, executors
 ├── proto/flowforge/        # .proto contracts (common/health/scheduler/recovery)
 ├── deploy/                 # Prometheus + Grafana provisioning
-├── docs/                   # Documentation (this audit)
+├── docs/                   # Architecture, API, gRPC, deployment, diagrams
 ├── scripts/                # loadtest.sh, gen-proto.sh
 ├── schema.sql              # Database schema (applied on startup)
 ├── docker-compose.yml      # Full local stack
@@ -339,10 +392,9 @@ ID, commits offsets only after processing, and skips malformed envelopes.
 
 ## Configuration
 
-All configuration is via environment variables with production-safe defaults;
-every hardening feature is **off by default**. See [.env.example](.env.example)
-and the full reference in
-[docs/production/CONFIGURATION.md](docs/production/CONFIGURATION.md).
+All configuration is via environment variables with sensible defaults; the
+optional guards (TLS, rate limiting, body limits, profiling) are **off by
+default**. See [.env.example](.env.example) for the full annotated list.
 
 Key groups: core (`PORT`, `DB_URL`, `ENV`), connection pool (`DB_MAX_OPEN_CONNS`
 …), worker/outbox tuning, Kafka/Redis, security (`GRPC_TLS_*`, `RATE_LIMIT_*`,
@@ -354,63 +406,81 @@ Key groups: core (`PORT`, `DB_URL`, `ENV`), connection pool (`DB_MAX_OPEN_CONNS`
   process. Dashboards provisioned in Grafana (`deploy/grafana/`).
 - **Tracing** — OpenTelemetry → OTLP → Jaeger (enable with
   `OTEL_DISABLED=false`). Trace context propagates across HTTP, gRPC, and Kafka.
-- **Logging** — structured JSON via Zap, with correlation IDs (`X-Request-ID`).
+- **Logging** — structured JSON via Zap in the service layer, with correlation
+  IDs (`X-Request-ID`) propagated through requests. Some worker subsystems still
+  use the standard library logger.
 
-Alerting rules live in `deploy/prometheus/alerts.yml`. See
-[docs/operations.md](docs/operations.md).
-
-## Benchmarks
-
-Go benchmarks cover DAG validation (`BenchmarkValidateChain`,
-`BenchmarkValidateWide`) and gRPC retry backoff (`BenchmarkNextBackoff`). A
-system-level load-test helper is provided in `scripts/loadtest.sh`.
-
-```bash
-go test -bench=. -benchmem ./internal/dag/... ./internal/grpcutil/...
-```
-
-See [docs/benchmarking.md](docs/benchmarking.md) for methodology and how to
-capture results.
+Alerting rules live in `deploy/prometheus/alerts.yml`.
 
 ## Testing
 
-Layered test suite (see [docs/testing.md](docs/testing.md)):
+```bash
+go test ./...                              # unit tests, no external deps
+go test -race ./...                        # race detector
+go test -tags chaos ./internal/outbox/...  # failure injection, infra-free
+go test -bench=. ./internal/dag/... ./internal/grpcutil/...
 
-- **Unit** — default `go test ./...` (no external dependencies).
-- **Integration** — `-tags integration`, requires `TEST_DB_URL` (real Postgres).
-- **Chaos** — `-tags chaos`, infra-free failure injection.
-- **Benchmarks** — `go test -bench`.
+# integration tests need a real Postgres
+TEST_DB_URL="postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable" \
+  go test -tags integration ./...
+```
+
+The suite is layered: fast unit tests by default, integration tests behind
+`-tags integration`, and chaos/failure-injection tests behind `-tags chaos`.
+
+## Failure Handling
+
+The interesting parts of FlowForge are what happens when things go wrong:
+
+| Failure | How it's handled |
+|---|---|
+| **Task throws / times out** | Marked failed, moved to `RETRY_WAIT` with exponential backoff; the scheduler promotes it back to `READY` when due. |
+| **Retries exhausted** | Task is dead-lettered (`dead_letter_tasks`), workflow marked `FAILED`, queryable via the API. |
+| **Worker crashes mid-task** | Its Redis lease expires; a recovery loop reclaims the stale task and resets it to `READY`. |
+| **Zombie worker wakes up** | Fencing tokens: its guarded writes no-op because the task's token has moved on, so it can't corrupt a reclaimed task. |
+| **DB commit succeeds but Kafka write fails** | Avoided entirely — events are written to an outbox table in the same transaction and published separately, at-least-once. |
+| **Duplicate event delivery** | Consumers dedupe by event ID and commit offsets only after processing. |
+| **Two workers claim the same task** | Prevented by `SELECT ... FOR UPDATE SKIP LOCKED` — claiming is a single atomic SQL statement. |
+| **Process restart** | Every process is stateless; in-flight tasks are drained on shutdown or recovered afterwards. |
+
+See [docs/diagrams/retry.md](docs/diagrams/retry.md) and
+[docs/diagrams/recovery.md](docs/diagrams/recovery.md) for the flows.
+
+## Distributed Systems Concepts Demonstrated
+
+- **Database-backed work queue** with `FOR UPDATE SKIP LOCKED` for lock-free
+  concurrent claiming.
+- **Fencing tokens** to make leases safe against stale/zombie workers.
+- **Lease-based liveness** in Redis, kept separate from correctness (which lives
+  in Postgres).
+- **Transactional outbox** to solve the dual-write problem between a database
+  and a message broker.
+- **At-least-once delivery with idempotent consumers** instead of pretending
+  exactly-once exists.
+- **Idempotent, guarded state transitions** so retries and replays are safe.
+- **Graceful shutdown and crash recovery** for stateless processes.
+- **Backpressure** via bounded worker pools and queues.
 
 ## Documentation
 
 | Doc | Purpose |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | System architecture + boundaries |
+| [docs/architecture.md](docs/architecture.md) | System architecture, components, and boundaries |
 | [docs/api.md](docs/api.md) | REST API reference |
-| [docs/grpc.md](docs/grpc.md) | gRPC service reference |
-| [docs/deployment.md](docs/deployment.md) | Deployment guide |
-| [docs/operations.md](docs/operations.md) | Operations runbook |
-| [docs/benchmarking.md](docs/benchmarking.md) | Benchmark report |
-| [docs/testing.md](docs/testing.md) | Test coverage report |
-| [docs/release.md](docs/release.md) | Release checklist + audit findings |
-| [docs/diagrams/](docs/diagrams/) | Architecture + sequence diagrams |
-| [docs/adr/](docs/adr/) | Architecture Decision Records |
-| [docs/production/](docs/production/README.md) | Production runbooks |
+| [docs/grpc.md](docs/grpc.md) | Internal gRPC services |
+| [docs/deployment.md](docs/deployment.md) | Running locally with Docker Compose |
+| [docs/diagrams/](docs/diagrams/) | System, workflow, retry, recovery, and event-flow diagrams |
 
-## Contributing
+## Future Improvements
 
-1. Fork and create a feature branch.
-2. Follow existing code style; run `gofmt -l .`, `go vet ./...`, and
-   `go test ./...` before submitting.
-3. Add tests for new behavior. Keep changes focused.
-4. Regenerate protobuf via `./scripts/gen-proto.sh` if you touch `.proto` files.
-5. Open a pull request describing the change and its rationale.
+Things I'd tackle next if I kept building this:
 
-See [CONTRIBUTING](docs/release.md#contributing) notes and the Definition of
-Done in `AGENT.md`.
-
-## License
-
-See [LICENSE](LICENSE). *(No license file is currently present in the
-repository — add one before public release; see
-[docs/release.md](docs/release.md).)*
+- Make the `internal/worker` unit tests hermetic (they currently need Redis) and
+  add a CI pipeline.
+- Standardize REST route prefixes (some endpoints predate the `/api/v1/` scheme)
+  and return `404` instead of `500` for missing runs.
+- Batch outbox publishing to Kafka for higher throughput.
+- Add retention/pruning for the dead-letter table.
+- Add more executor types beyond the built-in `SLEEP` reference.
+- A dockerized end-to-end test asserting a workflow completes and emits the
+  expected Kafka events.

@@ -1,10 +1,8 @@
 # Deployment Guide
 
-How to build, configure, and deploy FlowForge across development, Docker Compose,
-and production. This is the top-level guide; deeper production runbooks live in
-[production/DEPLOYMENT.md](production/DEPLOYMENT.md),
-[production/SCALING.md](production/SCALING.md), and
-[production/CONFIGURATION.md](production/CONFIGURATION.md).
+How to build, configure, and run FlowForge locally with Docker Compose. This
+project targets a single-host Compose setup; running it on an orchestrator is
+possible but not provided.
 
 ## Deployable Units
 
@@ -99,23 +97,27 @@ Reverse of startup. All processes handle `SIGTERM`/`SIGINT` via
 | `GET /readyz` | Readiness | DB reachable; safe for traffic (503 otherwise) |
 | gRPC `HealthService/Check` | Internal | Liveness/readiness for gRPC services |
 
-Wire orchestrator probes accordingly. Readiness returning 503 removes an
-instance from rotation during dependency outages without restarting it.
+Readiness returning 503 lets a load balancer drop an instance during a
+dependency outage without restarting it.
 
-## Production Configuration Highlights
+## Key Environment Variables
 
-Set before rollout (full list in [production/CONFIGURATION.md](production/CONFIGURATION.md)):
+The full annotated list is in [.env.example](../.env.example). The ones you'll
+usually set:
 
-- `ENV=production`, `LOG_LEVEL=info`.
-- Managed `DB_URL`, `REDIS_ADDR`, `KAFKA_BROKERS`.
-- TLS: `GRPC_TLS_ENABLED=true` (+ cert/key, CA for mTLS).
-- Limits: `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST`, `MAX_REQUEST_BODY_BYTES`.
-- Pool: `DB_MAX_OPEN_CONNS` within the DB connection budget (see
-  [production/SCALING.md](production/SCALING.md)).
-- Tracing: `OTEL_DISABLED=false`, `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- Keep `PPROF_ENABLED=false` unless actively profiling.
+| Variable | Purpose |
+|---|---|
+| `DB_URL` | PostgreSQL connection string (required) |
+| `REDIS_ADDR` | Redis address for leases/heartbeats |
+| `KAFKA_BROKERS` | Kafka bootstrap brokers |
+| `PORT` / `METRICS_ADDR` / `GRPC_ADDR` | Listen addresses |
+| `SCHEDULER_ADDR` / `RECOVERY_ADDR` | Use standalone gRPC services (optional) |
+| `DB_MAX_OPEN_CONNS` | Bound the connection pool |
+| `GRPC_TLS_ENABLED` (+ cert/key/CA) | Enable gRPC TLS/mTLS (off by default) |
+| `RATE_LIMIT_RPS` / `MAX_REQUEST_BODY_BYTES` | API guards (off by default) |
+| `OTEL_DISABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT` | Tracing to Jaeger |
 
-## Rolling Updates & Migrations
+## Updates & Migrations
 
 - Deploy one replica at a time; graceful shutdown prevents task loss.
 - `schema.sql` is idempotent DDL applied on API startup (`SCHEMA_PATH`). Keep

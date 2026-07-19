@@ -15,12 +15,11 @@ binary on `PORT` (default `:8080`). All routes are defined in
   `429 Too Many Requests` with `Retry-After: 1`. Disabled by default.
 - **Timeouts:** `ReadTimeout 10s`, `ReadHeaderTimeout 5s`, `WriteTimeout 10s`,
   `IdleTimeout 60s`.
-- **Authentication:** none built in — deploy behind an auth proxy/gateway (see
-  [production/SECURITY.md](production/SECURITY.md)).
+- **Authentication:** none built in — deploy behind an auth proxy/gateway.
 
-> **Path convention note (audit finding):** `POST /runs` and `GET /runs/{id}`
-> do **not** carry the `/api/v1/` prefix used by newer endpoints. Both styles
-> coexist in the current implementation. Documented as-is, not silently changed.
+> **Path convention note:** `POST /runs` and `GET /runs/{id}` do **not** carry
+> the `/api/v1/` prefix used by newer endpoints. Both styles coexist in the
+> current implementation.
 
 ## Endpoint Summary
 
@@ -233,7 +232,7 @@ Wire orchestrator liveness probes to `/healthz` and readiness probes to
 
 Prometheus exposition of `flowforge_*` metrics (registered only when the metrics
 registry is initialized). A dedicated metrics server also serves `/metrics` on
-`METRICS_ADDR`. See [operations.md](operations.md).
+`METRICS_ADDR`.
 
 ## Authentication Readiness
 
@@ -242,5 +241,3 @@ The API ships without authentication or authorization. For production:
 - Terminate TLS and authenticate at an ingress/API gateway.
 - Restrict network access to the API and to internal gRPC/metrics ports.
 - Apply `RATE_LIMIT_RPS`/`RATE_LIMIT_BURST` and `MAX_REQUEST_BODY_BYTES`.
-
-See [production/SECURITY.md](production/SECURITY.md).

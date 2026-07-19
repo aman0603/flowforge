@@ -99,8 +99,7 @@ See also the ASCII rendering in [diagrams/system.md](diagrams/system.md).
 
 ## 4. Ownership Boundaries (validated)
 
-These invariants are enforced by the implementation and validated in
-[release.md](release.md#final-architecture-validation):
+These invariants are enforced by the implementation:
 
 | Boundary | Owner | Evidence |
 |---|---|---|
@@ -151,9 +150,10 @@ PENDING ──(deps satisfied)──► READY ──(claim)──► CLAIMED ─
 
 Every claim increments `task_runs.fencing_token`. State-changing operations
 (`StartTaskRun`, `MarkTaskRunCompleted`, `MarkTaskRunFailed`) and recovery are
-guarded by the token, so a resurrected/slow worker cannot mutate a task that has
-since been reclaimed. This provides the exactly-effectively-once guarantee (with
-idempotent side effects).
+guarded by the token, so a resurrected or slow worker cannot mutate a task that
+has since been reclaimed. Combined with idempotent executors, this gives
+effectively-once execution: a task may be *attempted* more than once, but only
+one attempt can commit its result.
 
 ## 6. Concurrency & Coordination
 
@@ -181,8 +181,7 @@ idempotent side effects).
   orphaned attempt `ORPHANED` (failure type `WORKER_LOST`) and resetting the task
   to `READY`. Guarded by fencing token.
 
-The full failure model and validated recovery scenarios are in
-[production/CHAOS.md](production/CHAOS.md).
+See [diagrams/recovery.md](diagrams/recovery.md) for the recovery flow.
 
 ## 8. Event Delivery (Transactional Outbox)
 
@@ -207,17 +206,14 @@ events even if Kafka is down at write time.
   headers.
 - **Logging:** Zap JSON with a `service` field and correlation IDs.
 
-## 10. Known Architectural Notes (from audit)
+## 10. Known Architectural Notes
 
 - **Mixed route prefixes.** `POST /runs` and `GET /runs/{id}` lack the
-  `/api/v1/` prefix used by the newer endpoints. Documented, not silently
-  changed. See [api.md](api.md).
+  `/api/v1/` prefix used by the newer endpoints. See [api.md](api.md).
 - **`GET /runs/{id}` returns 500 (not 404) on missing rows**, unlike the history
-  and attempts endpoints which map `sql.ErrNoRows → 404`. Documented in
-  [api.md](api.md) and [release.md](release.md).
+  and attempts endpoints which map `sql.ErrNoRows → 404`. See [api.md](api.md).
 - **Some worker timing knobs** (`WORKER_POLL_INTERVAL`, `CLAIMED_STALE_TIMEOUT`,
   `RUNNING_STALE_TIMEOUT`, `RECOVERY_INTERVAL`) are parsed in `cmd/worker/main.go`
-  rather than in `internal/config`. Documented in
-  [production/CONFIGURATION.md](production/CONFIGURATION.md).
+  rather than in `internal/config`.
 - **No authentication** on the REST API — intended to sit behind an auth
-  proxy/gateway. See [production/SECURITY.md](production/SECURITY.md).
+  proxy/gateway.
