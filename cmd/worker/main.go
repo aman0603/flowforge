@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aman0603/flowforge/internal/config"
+	"github.com/aman0603/flowforge/internal/grpcutil"
 	"github.com/aman0603/flowforge/internal/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/scheduler"
@@ -85,7 +86,11 @@ func main() {
 	var sched scheduler.Client
 	if cfg.SchedulerAddr != "" {
 		sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
-		grpcSched, err := scheduler.NewGRPCClient(sctx, cfg.SchedulerAddr)
+		grpcSched, err := scheduler.NewGRPCClient(sctx, cfg.SchedulerAddr, &grpcutil.CallOptions{
+			MaxAttempts:    cfg.GRPCRetryMaxAttempts,
+			BaseDelay:      cfg.GRPCRetryBaseDelay,
+			RequestTimeout: cfg.GRPCRequestTimeout,
+		})
 		scancel()
 		if err != nil {
 			log.Fatalf("[worker-%s] Failed to connect to scheduler at %s: %v", workerID, cfg.SchedulerAddr, err)
@@ -102,7 +107,11 @@ func main() {
 	var recov recovery.Client
 	if cfg.RecoveryAddr != "" {
 		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
-		grpcRecov, err := recovery.NewGRPCClient(rctx, cfg.RecoveryAddr)
+		grpcRecov, err := recovery.NewGRPCClient(rctx, cfg.RecoveryAddr, &grpcutil.CallOptions{
+			MaxAttempts:    cfg.GRPCRetryMaxAttempts,
+			BaseDelay:      cfg.GRPCRetryBaseDelay,
+			RequestTimeout: cfg.GRPCRequestTimeout,
+		})
 		rcancel()
 		if err != nil {
 			log.Fatalf("[worker-%s] Failed to connect to recovery at %s: %v", workerID, cfg.RecoveryAddr, err)

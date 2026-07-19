@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aman0603/flowforge/internal/grpcutil"
 	"github.com/aman0603/flowforge/internal/model"
 	pbsched "github.com/aman0603/flowforge/internal/proto/scheduler"
 	"google.golang.org/grpc"
@@ -16,13 +17,18 @@ import (
 type GRPCClient struct {
 	conn   *grpc.ClientConn
 	client pbsched.SchedulerServiceClient
+	opts   grpcutil.CallOptions
 }
 
 // NewGRPCClient dials the Scheduler service at addr and returns a Client. The
-// caller is responsible for calling Close when done.
-func NewGRPCClient(ctx context.Context, addr string) (*GRPCClient, error) {
+// caller must Close it when done. opts is optional; nil selects defaults.
+func NewGRPCClient(ctx context.Context, addr string, opts ...*grpcutil.CallOptions) (*GRPCClient, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("scheduler gRPC address is empty")
+	}
+	callOpts := grpcutil.DefaultCallOptions()
+	if len(opts) > 0 && opts[0] != nil {
+		callOpts = *opts[0]
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -36,6 +42,7 @@ func NewGRPCClient(ctx context.Context, addr string) (*GRPCClient, error) {
 	return &GRPCClient{
 		conn:   conn,
 		client: pbsched.NewSchedulerServiceClient(conn),
+		opts:   callOpts,
 	}, nil
 }
 
@@ -46,10 +53,19 @@ func (c *GRPCClient) Close() error {
 
 // ClaimTasks calls the SchedulerService over gRPC and maps the response back to
 // domain models. A structured error from the server is returned as a Go error.
+// The call is wrapped with deadline + retry/backoff resilience.
 func (c *GRPCClient) ClaimTasks(ctx context.Context, workerID string, capacity int) ([]*model.ClaimedTask, error) {
-	resp, err := c.client.ClaimTasks(ctx, &pbsched.ClaimTasksRequest{
-		WorkerId: workerID,
-		Capacity: int32(capacity),
+	var resp *pbsched.ClaimTasksResponse
+	err := grpcutil.Call(ctx, c.opts, func(ctx context.Context) error {
+		r, callErr := c.client.ClaimTasks(ctx, &pbsched.ClaimTasksRequest{
+			WorkerId: workerID,
+			Capacity: int32(capacity),
+		})
+		if callErr != nil {
+			return callErr
+		}
+		resp = r
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scheduler ClaimTasks RPC failed: %w", err)
@@ -78,9 +94,17 @@ func (c *GRPCClient) ClaimTasks(ctx context.Context, workerID string, capacity i
 	return tasks, nil
 }
 
-// PromoteRetries calls the SchedulerService over gRPC.
+// PromoteRetries calls the SchedulerService over gRPC with resilience.
 func (c *GRPCClient) PromoteRetries(ctx context.Context) (int64, error) {
-	resp, err := c.client.PromoteRetries(ctx, &pbsched.PromoteRetriesRequest{})
+	var resp *pbsched.PromoteRetriesResponse
+	err := grpcutil.Call(ctx, c.opts, func(ctx context.Context) error {
+		r, callErr := c.client.PromoteRetries(ctx, &pbsched.PromoteRetriesRequest{})
+		if callErr != nil {
+			return callErr
+		}
+		resp = r
+		return nil
+	})
 	if err != nil {
 		return 0, fmt.Errorf("scheduler PromoteRetries RPC failed: %w", err)
 	}

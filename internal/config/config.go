@@ -30,6 +30,9 @@ type Config struct {
 	KafkaClientID           string
 	SchedulerAddr           string
 	RecoveryAddr            string
+	GRPCRetryMaxAttempts    int
+	GRPCRetryBaseDelay      time.Duration
+	GRPCRequestTimeout      time.Duration
 	OutboxPollInterval      time.Duration
 	OutboxBatchSize         int
 	OutboxClaimTimeout      time.Duration
@@ -104,6 +107,21 @@ func Load() *Config {
 		retention = 24 * time.Hour
 	}
 
+	grpcRetryMaxAttempts := 3
+	if v, err := strconv.Atoi(getEnv("GRPC_RETRY_MAX_ATTEMPTS", "3")); err == nil && v >= 0 {
+		grpcRetryMaxAttempts = v
+	}
+
+	grpcRetryBaseDelay, err := time.ParseDuration(getEnv("GRPC_RETRY_BASE_DELAY", "50ms"))
+	if err != nil {
+		grpcRetryBaseDelay = 50 * time.Millisecond
+	}
+
+	grpcRequestTimeout, err := time.ParseDuration(getEnv("GRPC_REQUEST_TIMEOUT", "5s"))
+	if err != nil {
+		grpcRequestTimeout = 5 * time.Second
+	}
+
 	return &Config{
 		Port:                    getEnv("PORT", "8080"),
 		GRPCAddr:                getEnv("GRPC_ADDR", "0.0.0.0:9090"),
@@ -126,6 +144,9 @@ func Load() *Config {
 		KafkaClientID:           getEnv("KAFKA_CLIENT_ID", "flowforge-publisher"),
 		SchedulerAddr:           getEnv("SCHEDULER_ADDR", ""),
 		RecoveryAddr:            getEnv("RECOVERY_ADDR", ""),
+		GRPCRetryMaxAttempts:    grpcRetryMaxAttempts,
+		GRPCRetryBaseDelay:      grpcRetryBaseDelay,
+		GRPCRequestTimeout:      grpcRequestTimeout,
 		OutboxPollInterval:      pollInterval,
 		OutboxBatchSize:         batchSizeOutbox,
 		OutboxClaimTimeout:      claimTimeout,
