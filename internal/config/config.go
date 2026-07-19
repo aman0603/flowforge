@@ -42,6 +42,7 @@ type Config struct {
 	OTelServiceName         string
 	OTelExporterEndpoint    string
 	MetricsAddr             string
+	PProfEnabled            bool
 	LogLevel                string
 	OutboxPollInterval      time.Duration
 	OutboxBatchSize         int
@@ -159,6 +160,7 @@ func Load() *Config {
 	}
 	otelExporterEndpoint := getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
 	metricsAddr := getEnv("METRICS_ADDR", ":9091")
+	pprofEnabled := getEnv("PPROF_ENABLED", "false") == "true"
 	logLevel := getEnv("LOG_LEVEL", "info")
 
 	return &Config{
@@ -194,6 +196,7 @@ func Load() *Config {
 		OTelServiceName:         otelServiceName,
 		OTelExporterEndpoint:    otelExporterEndpoint,
 		MetricsAddr:             metricsAddr,
+		PProfEnabled:            pprofEnabled,
 		LogLevel:                logLevel,
 		OutboxPollInterval:      pollInterval,
 		OutboxBatchSize:         batchSizeOutbox,

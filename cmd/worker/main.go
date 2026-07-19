@@ -32,6 +32,7 @@ func main() {
 		OTelDisabled:     cfg.OTelDisabled,
 		ExporterEndpoint: cfg.OTelExporterEndpoint,
 		MetricsAddr:      cfg.MetricsAddr,
+		PProfEnabled:     cfg.PProfEnabled,
 		LogLevel:         cfg.LogLevel,
 	})
 	if err != nil {

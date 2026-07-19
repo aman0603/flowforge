@@ -77,12 +77,23 @@ func Call(ctx context.Context, opts CallOptions, fn func(ctx context.Context) er
 			return ctx.Err()
 		case <-timer.C:
 		}
-		delay *= 2
-		if delay > 2*time.Second {
-			delay = 2 * time.Second
-		}
+		delay = nextBackoff(delay)
 	}
 	return lastErr
+}
+
+// maxBackoff caps the exponential backoff so a long retry chain cannot stall a
+// caller indefinitely.
+const maxBackoff = 2 * time.Second
+
+// nextBackoff doubles the current delay, clamped to maxBackoff. It is a pure
+// function so the backoff policy can be unit-tested and benchmarked directly.
+func nextBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > maxBackoff {
+		return maxBackoff
+	}
+	return next
 }
 
 func runOnce(parent context.Context, timeout time.Duration, fn func(ctx context.Context) error) error {

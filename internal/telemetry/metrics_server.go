@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"net/http"
+	"net/http/pprof"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -14,6 +15,9 @@ import (
 func (t *Telemetry) ServeMetrics(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(t.registry, promhttp.HandlerOpts{}))
+	if t.pprofEnabled {
+		registerPProf(mux)
+	}
 	srv := &http.Server{
 		Addr:              t.MetricsAddr(),
 		Handler:           mux,
@@ -29,6 +33,16 @@ func (t *Telemetry) ServeMetrics(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// registerPProf mounts the standard net/http/pprof handlers under /debug/pprof
+// on the supplied mux. Kept separate so it can be unit-tested in isolation.
+func registerPProf(mux *http.ServeMux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 }
 
 // MetricsAddr returns the configured metrics listen address.

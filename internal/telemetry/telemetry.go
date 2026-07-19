@@ -38,6 +38,7 @@ type Telemetry struct {
 	meterProv    metric.MeterProvider
 	registry     *promclient.Registry
 	metricsAddr  string
+	pprofEnabled bool
 	shutdownOnce sync.Once
 	shutdownFns  []func(context.Context) error
 }
@@ -56,6 +57,10 @@ type Config struct {
 	ExporterEndpoint string
 	MetricsAddr      string
 	LogLevel         string
+	// PProfEnabled exposes net/http/pprof handlers on the metrics server. It is
+	// opt-in (default false) because pprof endpoints can leak internal details
+	// and add overhead; enable only in controlled environments.
+	PProfEnabled bool
 }
 
 // Init builds the providers and logger and stores them as the package-global
@@ -95,6 +100,7 @@ func Init(cfg Config) (*Telemetry, error) {
 	t.meterProv = mp
 	t.registry = promReg
 	t.metricsAddr = cfg.MetricsAddr
+	t.pprofEnabled = cfg.PProfEnabled
 	t.shutdownFns = append(t.shutdownFns, func(ctx context.Context) error {
 		sCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 		defer cancel()
