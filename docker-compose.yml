@@ -62,6 +62,7 @@ services:
       - "8080:8080"
     environment:
       PORT: "8080"
+      GRPC_ADDR: "0.0.0.0:9090"
       DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
       ENV: "development"
       SCHEMA_PATH: "schema.sql"
@@ -75,6 +76,34 @@ services:
       redis:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["./scheduler"]
+    ports:
+      - "9091:9090"
+    environment:
+      GRPC_ADDR: "0.0.0.0:9090"
+      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  recovery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["./recovery"]
+    ports:
+      - "9092:9090"
+    environment:
+      GRPC_ADDR: "0.0.0.0:9090"
+      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+    depends_on:
+      db:
         condition: service_healthy
 
   worker:
@@ -100,6 +129,8 @@ services:
       KAFKA_BROKERS: "kafka:29092"
       KAFKA_TOPIC: "flowforge.workflow-events.v1"
       KAFKA_CLIENT_ID: "flowforge-worker"
+      SCHEDULER_ADDR: "scheduler:9090"
+      RECOVERY_ADDR: "recovery:9090"
     depends_on:
       db:
         condition: service_healthy
@@ -107,6 +138,10 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      scheduler:
+        condition: service_started
+      recovery:
+        condition: service_started
 
   publisher:
     build:

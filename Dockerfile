@@ -16,6 +16,8 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/flowforge cmd/flowforge/main.go
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/worker cmd/worker/main.go
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/publisher cmd/publisher/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/scheduler cmd/scheduler/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/recovery cmd/recovery/main.go
 
 # --- Run Stage ---
 FROM alpine:3.20
@@ -29,6 +31,8 @@ RUN apk --no-cache add ca-certificates
 COPY --from=builder /app/flowforge .
 COPY --from=builder /app/worker .
 COPY --from=builder /app/publisher .
+COPY --from=builder /app/scheduler .
+COPY --from=builder /app/recovery .
 COPY --from=builder /app/schema.sql .
 
 # Expose HTTP port
