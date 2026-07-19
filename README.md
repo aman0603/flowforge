@@ -189,6 +189,78 @@ The `docker-compose.yml` now defines `scheduler` (port `9091:9090`) and `recover
 
 ---
 
+## Phase 12: Observability & Production Operations
+
+Every FlowForge service is instrumented through a single shared package
+(`internal/telemetry`) that wires OpenTelemetry tracing, Prometheus metrics, and
+structured JSON logging. Observability is **opt-in for tracing** and never
+changes business behavior — when `OTEL_DISABLED=true` (the default) the tracer is
+a no-op while metrics and logs still work.
+
+### Metrics
+
+Each binary exposes a Prometheus scrape endpoint at `/metrics` on `METRICS_ADDR`
+(default `:9091`). Key instruments:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `flowforge_http_requests_total` | counter | HTTP requests by method/path/status |
+| `flowforge_http_request_duration_seconds` | histogram | HTTP latency |
+| `flowforge_grpc_requests_total` | counter | gRPC calls by method/code |
+| `flowforge_grpc_request_duration_seconds` | histogram | gRPC latency |
+| `flowforge_tasks_claimed/started/completed/failed/timed_out_total` | counter | worker task lifecycle |
+| `flowforge_worker_queue_depth` | gauge | queued vs active executions |
+| `flowforge_tasks_recovered_total` | counter | stale tasks reclaimed |
+| `flowforge_outbox_published/failed/retried/cleaned_total` | counter | publisher throughput |
+
+### Tracing
+
+A trace flows **HTTP → gRPC → Kafka** via W3C TraceContext propagation. The HTTP
+middleware opens a server span and mints/propagates an `X-Request-ID`
+correlation ID; the gRPC client interceptor injects trace context and the
+correlation ID into metadata; the Kafka publisher injects them into message
+headers, and the event-consumer extracts them to continue the trace. Set
+`OTEL_DISABLED=false` and `OTEL_EXPORTER_OTLP_ENDPOINT` (default `localhost:4317`)
+to export spans to Jaeger.
+
+### Structured logging
+
+Logs are JSON via `zap`, tagged with `service` and (where available)
+`worker_id`, `trace_id`, `span_id`, and `request_id`. Database URLs are redacted
+before logging and task payloads are never logged.
+
+### Health endpoints
+
+* `GET /health` — legacy always-200 check.
+* `GET /healthz` — liveness (process up).
+* `GET /readyz` — readiness; returns `503` until PostgreSQL is reachable.
+* gRPC services expose the standard gRPC Health protocol (DB-backed checker).
+
+### Observability stack
+
+`docker compose up` also starts **Prometheus** (`:9090`), **Grafana** (`:3000`,
+admin/admin, with a provisioned "FlowForge Overview" dashboard), and **Jaeger**
+(`:16686`). Deploy assets live under `deploy/`:
+
+```
+deploy/prometheus/prometheus.yml   # scrape config for all services
+deploy/prometheus/alerts.yml       # availability/failure/latency alert rules
+deploy/grafana/provisioning/       # datasource + dashboard providers
+deploy/grafana/dashboards/         # FlowForge Overview dashboard JSON
+```
+
+### Observability config
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OTEL_DISABLED` | `true` | disable tracing (no-op tracer) |
+| `OTEL_SERVICE_NAME` | `flowforge` | service name on spans/resources |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` | OTLP/gRPC collector (Jaeger) |
+| `METRICS_ADDR` | `:9091` | Prometheus `/metrics` listen address |
+| `LOG_LEVEL` | `info` | zap log level |
+
+---
+
 ## How to Run & Build
 
 ### Using Docker (Recommended)

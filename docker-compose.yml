@@ -70,6 +70,11 @@ services:
       KAFKA_BROKERS: "kafka:29092"
       KAFKA_TOPIC: "flowforge.workflow-events.v1"
       KAFKA_CLIENT_ID: "flowforge-app"
+      METRICS_ADDR: "0.0.0.0:9091"
+      OTEL_DISABLED: "false"
+      OTEL_SERVICE_NAME: "flowforge-api"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      LOG_LEVEL: "info"
     depends_on:
       db:
         condition: service_healthy
@@ -88,6 +93,11 @@ services:
     environment:
       GRPC_ADDR: "0.0.0.0:9090"
       DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      METRICS_ADDR: "0.0.0.0:9091"
+      OTEL_DISABLED: "false"
+      OTEL_SERVICE_NAME: "flowforge-scheduler"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      LOG_LEVEL: "info"
     depends_on:
       db:
         condition: service_healthy
@@ -102,6 +112,11 @@ services:
     environment:
       GRPC_ADDR: "0.0.0.0:9090"
       DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      METRICS_ADDR: "0.0.0.0:9091"
+      OTEL_DISABLED: "false"
+      OTEL_SERVICE_NAME: "flowforge-recovery"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      LOG_LEVEL: "info"
     depends_on:
       db:
         condition: service_healthy
@@ -131,6 +146,11 @@ services:
       KAFKA_CLIENT_ID: "flowforge-worker"
       SCHEDULER_ADDR: "scheduler:9090"
       RECOVERY_ADDR: "recovery:9090"
+      METRICS_ADDR: "0.0.0.0:9091"
+      OTEL_DISABLED: "false"
+      OTEL_SERVICE_NAME: "flowforge-worker"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      LOG_LEVEL: "info"
     depends_on:
       db:
         condition: service_healthy
@@ -159,11 +179,53 @@ services:
       OUTBOX_MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
       OUTBOX_RETRY_BASE_DELAY: "${OUTBOX_RETRY_BASE_DELAY:-1s}"
       OUTBOX_RETENTION: "${OUTBOX_RETENTION:-24h}"
+      METRICS_ADDR: "0.0.0.0:9091"
+      OTEL_DISABLED: "false"
+      OTEL_SERVICE_NAME: "flowforge-publisher"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      LOG_LEVEL: "info"
     depends_on:
       db:
         condition: service_healthy
       kafka:
         condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: flowforge-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    depends_on:
+      - app
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: flowforge-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: flowforge-jaeger
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
 
 volumes:
   pgdata:

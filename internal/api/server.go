@@ -22,10 +22,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// pinger is the minimal readiness dependency: something that can verify its
+// backing store is reachable. *repository.Repository satisfies it, and tests can
+// substitute a fake to exercise the /readyz probe without a real database.
+type pinger interface {
+	Ping(ctx context.Context) error
+}
+
 // Server represents the HTTP server.
 type Server struct {
 	cfg    *config.Config
 	repo   *repository.Repository
+	ready  pinger
 	router *http.ServeMux
 }
 
@@ -36,6 +44,9 @@ func NewServer(cfg *config.Config, repo *repository.Repository) *Server {
 		repo:   repo,
 		router: http.NewServeMux(),
 	}
+	if repo != nil {
+		s.ready = repo
+	}
 	s.registerRoutes()
 	return s
 }
@@ -43,6 +54,8 @@ func NewServer(cfg *config.Config, repo *repository.Repository) *Server {
 // registerRoutes sets up the endpoints.
 func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /health", s.handleHealth)
+	s.router.HandleFunc("GET /healthz", s.handleLiveness)
+	s.router.HandleFunc("GET /readyz", s.handleReadiness)
 	s.router.HandleFunc("POST /api/v1/workflows", s.handleCreateDefinition)
 	s.router.HandleFunc("POST /runs", s.handleCreateRun)
 	s.router.HandleFunc("GET /runs/{id}", s.handleGetRunDetails)
@@ -59,6 +72,35 @@ func (s *Server) registerRoutes() {
 // handleHealth responds with a JSON status OK.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleLiveness is the Kubernetes-style liveness probe: it returns 200 as long
+// as the process is running and able to serve HTTP. It does not check
+// dependencies so a transient DB outage does not cause pod restarts.
+func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
+}
+
+// handleReadiness is the readiness probe: it returns 200 only when the database
+// is reachable, otherwise 503 so traffic is not routed to an unready instance.
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if s.ready == nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unready",
+			"reason": "no readiness dependency configured",
+		})
+		return
+	}
+	pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.ready.Ping(pingCtx); err != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unready",
+			"reason": "database unreachable",
+		})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 // handleCreateDefinition handles POST /definitions.

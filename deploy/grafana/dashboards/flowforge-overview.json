@@ -1,0 +1,83 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": ["flowforge"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "FlowForge Overview",
+  "uid": "flowforge-overview",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP request rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "sum(rate(flowforge_http_requests_total[5m])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "HTTP p95 latency (s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(flowforge_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Task throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "sum(rate(flowforge_tasks_completed_total[5m]))", "legendFormat": "completed" },
+        { "expr": "sum(rate(flowforge_tasks_failed_total[5m]))", "legendFormat": "failed" },
+        { "expr": "sum(rate(flowforge_tasks_claimed_total[5m]))", "legendFormat": "claimed" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Worker queue depth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "sum(flowforge_worker_queue_depth) by (state)", "legendFormat": "{{state}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "gRPC request rate by code",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "sum(rate(flowforge_grpc_requests_total[5m])) by (code)", "legendFormat": "{{code}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Outbox publish vs failure",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "sum(rate(flowforge_outbox_published_total[5m]))", "legendFormat": "published" },
+        { "expr": "sum(rate(flowforge_outbox_failed_total[5m]))", "legendFormat": "failed" }
+      ]
+    }
+  ]
+}

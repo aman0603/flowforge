@@ -1,0 +1,58 @@
+groups:
+  - name: flowforge-availability
+    rules:
+      - alert: FlowForgeServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "FlowForge service {{ $labels.job }} is down"
+          description: "Prometheus target {{ $labels.instance }} ({{ $labels.job }}) has been unreachable for over 1 minute."
+
+  - name: flowforge-tasks
+    rules:
+      - alert: FlowForgeHighTaskFailureRate
+        expr: |
+          sum(rate(flowforge_tasks_failed_total[5m]))
+            /
+          clamp_min(sum(rate(flowforge_tasks_completed_total[5m])) + sum(rate(flowforge_tasks_failed_total[5m])), 1)
+            > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High task failure rate"
+          description: "More than 25% of tasks are failing over the last 5 minutes."
+
+      - alert: FlowForgeWorkerQueueBacklog
+        expr: max(flowforge_worker_queue_depth{state="queued"}) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker queue backlog is growing"
+          description: "Queued task depth has exceeded 1000 for 10 minutes; workers may be under-provisioned."
+
+  - name: flowforge-outbox
+    rules:
+      - alert: FlowForgeOutboxPublishFailures
+        expr: rate(flowforge_outbox_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox publish failures"
+          description: "The publisher is failing to write events to Kafka."
+
+  - name: flowforge-latency
+    rules:
+      - alert: FlowForgeHighHTTPLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(flowforge_http_request_duration_seconds_bucket[5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP p95 latency"
+          description: "The API p95 request latency has exceeded 1s for 5 minutes."
