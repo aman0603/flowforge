@@ -14,14 +14,13 @@ import (
 	"github.com/aman0603/flowforge/internal/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/telemetry"
+	"go.uber.org/zap"
 )
 
 // Recovery service: hosts the RecoveryService gRPC server (guarded stale-task
 // reclaim transitions) over the repository. It does not execute tasks.
 func main() {
 	cfg := config.Load()
-
-	log.Println("[recovery] Initializing FlowForge Recovery service...")
 
 	tel, err := telemetry.Init(telemetry.Config{
 		ServiceName:      cfg.OTelServiceName,
@@ -38,9 +37,12 @@ func main() {
 	}
 	defer telemetry.Shutdown(context.Background())
 
+	logger := tel.Logger()
+	logger.Info("initializing recovery service", zap.String("db", telemetry.RedactDBURL(cfg.DBURL)))
+
 	repo, err := repository.New(cfg.DBURL)
 	if err != nil {
-		log.Fatalf("[recovery] Failed to connect to database: %v", err)
+		logger.Fatal("failed to connect to database", zap.Error(err))
 	}
 	defer repo.Close()
 
@@ -52,16 +54,16 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("[recovery] Serving metrics on %s/metrics", cfg.MetricsAddr)
+		logger.Info("serving metrics", zap.String("addr", cfg.MetricsAddr))
 		if err := tel.ServeMetrics(ctx); err != nil {
-			log.Printf("[recovery] metrics server error: %v", err)
+			logger.Error("metrics server error", zap.Error(err))
 		}
 	}()
 
-	log.Printf("[recovery] Serving gRPC on %s", cfg.GRPCAddr)
+	logger.Info("serving grpc", zap.String("addr", cfg.GRPCAddr))
 	if err := grpcSrv.Start(); err != nil {
-		log.Fatalf("[recovery] gRPC server exited with error: %v", err)
+		logger.Fatal("grpc server exited with error", zap.Error(err))
 	}
 	<-ctx.Done()
-	log.Println("[recovery] Recovery service shutdown complete.")
+	logger.Info("recovery service shutdown complete")
 }

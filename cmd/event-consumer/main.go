@@ -17,6 +17,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 )
 
 // eventConsumer is a minimal, idempotent example consumer. It subscribes to the
@@ -123,10 +124,15 @@ func (c *eventConsumer) process(ctx context.Context, msg kafka.Message) error {
 }
 
 // defaultHandler is an example handler that logs the event. Real consumers
-// would dispatch on EventType and apply idempotent side effects.
-func defaultHandler(_ context.Context, env model.EventEnvelope) error {
-	fmt.Printf("[consumer] %s event %s (run=%s seq=%d version=%d)\n",
-		env.EventType, env.EventID, env.WorkflowRunID, env.Sequence, env.EventVersion)
+// would dispatch on EventType and apply idempotent side effects. It uses the
+// context-aware logger so trace_id/request_id from the Kafka headers appear.
+func defaultHandler(ctx context.Context, env model.EventEnvelope) error {
+	telemetry.Info(ctx, "consumed event",
+		zap.String("event_type", env.EventType),
+		zap.String("event_id", env.EventID),
+		zap.String("workflow_run_id", env.WorkflowRunID),
+		zap.Int64("sequence", env.Sequence),
+		zap.Int("event_version", env.EventVersion))
 	return nil
 }
 

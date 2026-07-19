@@ -12,16 +12,11 @@ import (
 	"github.com/aman0603/flowforge/internal/outbox"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/telemetry"
+	"go.uber.org/zap"
 )
 
 func main() {
 	cfg := config.Load()
-
-	logf := func(format string, args ...interface{}) {
-		fmt.Printf("[publisher] "+format+"\n", args...)
-	}
-
-	logf("Initializing FlowForge Outbox Publisher...")
 
 	tel, err := telemetry.Init(telemetry.Config{
 		ServiceName:      cfg.OTelServiceName,
@@ -40,10 +35,12 @@ func main() {
 	}
 	defer telemetry.Shutdown(context.Background())
 
+	logger := tel.Logger()
+	logger.Info("initializing outbox publisher", zap.String("db", telemetry.RedactDBURL(cfg.DBURL)))
+
 	repo, err := repository.New(cfg.DBURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[publisher] Failed to connect to database: %v\n", err)
-		os.Exit(1)
+		logger.Fatal("failed to connect to database", zap.Error(err))
 	}
 	defer repo.Close()
 
@@ -59,16 +56,18 @@ func main() {
 		m := publisher.Metrics()
 		return m.Published, m.Failed, m.Retried, m.CleanedUp
 	}); err != nil {
-		logf("Failed to register outbox metrics: %v", err)
+		logger.Error("failed to register outbox metrics", zap.Error(err))
 	}
 	go func() {
-		logf("Serving metrics on %s/metrics", cfg.MetricsAddr)
+		logger.Info("serving metrics", zap.String("addr", cfg.MetricsAddr))
 		if err := tel.ServeMetrics(ctx); err != nil {
-			logf("metrics server error: %v", err)
+			logger.Error("metrics server error", zap.Error(err))
 		}
 	}()
 
-	logf("Publisher started. Polling outbox every %s, retention %s.", cfg.OutboxPollInterval, cfg.OutboxRetention)
+	logger.Info("publisher started",
+		zap.Duration("poll_interval", cfg.OutboxPollInterval),
+		zap.Duration("retention", cfg.OutboxRetention))
 
 	// Periodic observability snapshot so operators can watch throughput and
 	// backlog without external tooling.
@@ -81,13 +80,16 @@ func main() {
 				return
 			case <-ticker.C:
 				m := publisher.Metrics()
-				logf("metrics published=%d failed=%d retried=%d cleaned=%d",
-					m.Published, m.Failed, m.Retried, m.CleanedUp)
+				logger.Info("outbox metrics",
+					zap.Int64("published", m.Published),
+					zap.Int64("failed", m.Failed),
+					zap.Int64("retried", m.Retried),
+					zap.Int64("cleaned", m.CleanedUp))
 			}
 		}
 	}()
 
 	publisher.Run(ctx)
 
-	logf("Publisher shutdown complete.")
+	logger.Info("publisher shutdown complete")
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/aman0603/flowforge/internal/scheduler"
 	"github.com/aman0603/flowforge/internal/telemetry"
 	"github.com/aman0603/flowforge/internal/worker"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -24,7 +25,6 @@ func main() {
 
 	// 1. Generate/Determine Worker ID
 	workerID := getWorkerID()
-	log.Printf("[worker-%s] Initializing FlowForge Worker process...", workerID)
 
 	// 1.5 Initialize observability.
 	tel, err := telemetry.Init(telemetry.Config{
@@ -42,10 +42,13 @@ func main() {
 	}
 	defer telemetry.Shutdown(context.Background())
 
+	logger := tel.Logger().With(zap.String("worker_id", workerID))
+	logger.Info("initializing worker process", zap.String("db", telemetry.RedactDBURL(cfg.DBURL)))
+
 	// 2. Connect to Database
 	repo, err := repository.New(cfg.DBURL)
 	if err != nil {
-		log.Fatalf("[worker-%s] Failed to connect to database: %v", workerID, err)
+		logger.Fatal("failed to connect to database", zap.Error(err))
 	}
 	defer repo.Close()
 
@@ -55,7 +58,7 @@ func main() {
 		if d, err := time.ParseDuration(intervalStr); err == nil {
 			pollInterval = d
 		} else {
-			log.Printf("[worker-%s] Warning: failed to parse WORKER_POLL_INTERVAL %q, using default 1s", workerID, intervalStr)
+			logger.Warn("failed to parse WORKER_POLL_INTERVAL, using default 1s", zap.String("value", intervalStr))
 		}
 	}
 
@@ -65,7 +68,7 @@ func main() {
 		if d, err := time.ParseDuration(val); err == nil {
 			claimedStaleTimeout = d
 		} else {
-			log.Printf("[worker-%s] Warning: failed to parse CLAIMED_STALE_TIMEOUT %q, using default 30s", workerID, val)
+			logger.Warn("failed to parse CLAIMED_STALE_TIMEOUT, using default 30s", zap.String("value", val))
 		}
 	}
 
@@ -74,7 +77,7 @@ func main() {
 		if d, err := time.ParseDuration(val); err == nil {
 			runningStaleTimeout = d
 		} else {
-			log.Printf("[worker-%s] Warning: failed to parse RUNNING_STALE_TIMEOUT %q, using default 5m", workerID, val)
+			logger.Warn("failed to parse RUNNING_STALE_TIMEOUT, using default 5m", zap.String("value", val))
 		}
 	}
 
@@ -83,14 +86,14 @@ func main() {
 		if d, err := time.ParseDuration(val); err == nil {
 			recoveryInterval = d
 		} else {
-			log.Printf("[worker-%s] Warning: failed to parse RECOVERY_INTERVAL %q, using default 30s", workerID, val)
+			logger.Warn("failed to parse RECOVERY_INTERVAL, using default 30s", zap.String("value", val))
 		}
 	}
 
 	// 5. Connect to Redis Coordination
 	coord, err := worker.NewRedisCoordinator(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 	if err != nil {
-		log.Fatalf("[worker-%s] Failed to connect to Redis coordination: %v", workerID, err)
+		logger.Fatal("failed to connect to redis coordination", zap.Error(err))
 	}
 	defer coord.Close()
 
@@ -110,14 +113,14 @@ func main() {
 		})
 		scancel()
 		if err != nil {
-			log.Fatalf("[worker-%s] Failed to connect to scheduler at %s: %v", workerID, cfg.SchedulerAddr, err)
+			logger.Fatal("failed to connect to scheduler", zap.String("addr", cfg.SchedulerAddr), zap.Error(err))
 		}
 		defer grpcSched.Close()
 		sched = grpcSched
-		log.Printf("[worker-%s] Using remote scheduler at %s", workerID, cfg.SchedulerAddr)
+		logger.Info("using remote scheduler", zap.String("addr", cfg.SchedulerAddr))
 	} else {
 		sched = scheduler.NewLocalClient(repo)
-		log.Printf("[worker-%s] Using local (in-process) scheduler", workerID)
+		logger.Info("using local (in-process) scheduler")
 	}
 
 	// 5.7 Choose recovery client: gRPC when RECOVERY_ADDR is set, else local.
@@ -131,14 +134,14 @@ func main() {
 		})
 		rcancel()
 		if err != nil {
-			log.Fatalf("[worker-%s] Failed to connect to recovery at %s: %v", workerID, cfg.RecoveryAddr, err)
+			logger.Fatal("failed to connect to recovery", zap.String("addr", cfg.RecoveryAddr), zap.Error(err))
 		}
 		defer grpcRecov.Close()
 		recov = grpcRecov
-		log.Printf("[worker-%s] Using remote recovery at %s", workerID, cfg.RecoveryAddr)
+		logger.Info("using remote recovery", zap.String("addr", cfg.RecoveryAddr))
 	} else {
 		recov = recovery.NewLocalClient(repo)
-		log.Printf("[worker-%s] Using local (in-process) recovery", workerID)
+		logger.Info("using local (in-process) recovery")
 	}
 
 	// 6. Construct Worker
@@ -182,21 +185,21 @@ func main() {
 			TotalLeaseLosses: c.TotalLeaseLosses,
 		}
 	}); err != nil {
-		log.Printf("[worker-%s] Failed to register worker metrics: %v", workerID, err)
+		logger.Error("failed to register worker metrics", zap.Error(err))
 	}
 	go func() {
-		log.Printf("[worker-%s] Serving metrics on %s/metrics", workerID, cfg.MetricsAddr)
+		logger.Info("serving metrics", zap.String("addr", cfg.MetricsAddr))
 		if err := tel.ServeMetrics(ctx); err != nil {
-			log.Printf("[worker-%s] metrics server error: %v", workerID, err)
+			logger.Error("metrics server error", zap.Error(err))
 		}
 	}()
 
 	// 7. Run Worker Loop
 	if err := w.Run(ctx); err != nil {
-		log.Fatalf("[worker-%s] Worker exited with error: %v", workerID, err)
+		logger.Fatal("worker exited with error", zap.Error(err))
 	}
 
-	log.Printf("[worker-%s] Worker process shutdown complete.", workerID)
+	logger.Info("worker process shutdown complete")
 }
 
 func getWorkerID() string {

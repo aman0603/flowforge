@@ -11,6 +11,7 @@ import (
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/telemetry"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -22,13 +23,14 @@ func main() {
 	cfg := config.Load()
 
 	// Initialize observability (tracing/metrics/logging).
-	if _, err := telemetry.Init(telemetry.Config{
+	tel, err := telemetry.Init(telemetry.Config{
 		ServiceName:      cfg.OTelServiceName,
 		OTelDisabled:     cfg.OTelDisabled,
 		ExporterEndpoint: cfg.OTelExporterEndpoint,
 		MetricsAddr:      cfg.MetricsAddr,
 		LogLevel:         cfg.LogLevel,
-	}); err != nil {
+	})
+	if err != nil {
 		log.Fatalf("Failed to initialize telemetry: %v", err)
 	}
 	if _, err := telemetry.InitMetrics(); err != nil {
@@ -36,32 +38,35 @@ func main() {
 	}
 	defer telemetry.Shutdown(context.Background())
 
+	logger := tel.Logger()
+	logger.Info("initializing api service", zap.String("db", telemetry.RedactDBURL(cfg.DBURL)))
+
 	// Initialize database repository
 	repo, err := repository.New(cfg.DBURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		logger.Fatal("failed to initialize database", zap.Error(err))
 	}
 	defer func() {
-		log.Println("Closing database connection...")
+		logger.Info("closing database connection")
 		if err := repo.Close(); err != nil {
-			log.Printf("Error closing database: %v", err)
+			logger.Error("error closing database", zap.Error(err))
 		}
 	}()
 
 	// Run schema creation
-	log.Printf("Initializing database schema from %s...", cfg.SchemaPath)
+	logger.Info("initializing database schema", zap.String("schema_path", cfg.SchemaPath))
 	if err := repo.InitializeSchema(cfg.SchemaPath); err != nil {
-		log.Fatalf("Failed to initialize database schema: %v", err)
+		logger.Fatal("failed to initialize database schema", zap.Error(err))
 	}
-	log.Println("Database schema initialized successfully.")
+	logger.Info("database schema initialized")
 
 	// Initialize API server with repo dependency
 	server := api.NewServer(cfg, repo)
 
 	// Start server with context for graceful shutdown
 	if err := server.Start(ctx); err != nil {
-		log.Fatalf("Server stopped with error: %v", err)
+		logger.Fatal("server stopped with error", zap.Error(err))
 	}
 
-	log.Println("Server exited successfully")
+	logger.Info("server exited successfully")
 }
