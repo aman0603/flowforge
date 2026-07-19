@@ -6,6 +6,7 @@ import (
 	"github.com/aman0603/flowforge/internal/proto/common"
 	pbrecov "github.com/aman0603/flowforge/internal/proto/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/telemetry"
 )
 
 // GRPCServer implements the generated RecoveryService interface using the
@@ -45,6 +46,11 @@ func (s *GRPCServer) RecoverTask(ctx context.Context, req *pbrecov.RecoverTaskRe
 				Message: err.Error(),
 			},
 		}, nil
+	}
+	if reclaimed {
+		if m := telemetry.GetMetrics(); m != nil {
+			m.TasksRecovered.Add(ctx, 1)
+		}
 	}
 	return &pbrecov.RecoverTaskResponse{Reclaimed: reclaimed}, nil
 }

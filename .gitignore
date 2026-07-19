@@ -1,3 +1,4 @@
 # Local phase planning artifacts (kept on disk, not tracked)
 docs/phases/
 PLANNER.md
+AGENTS.md

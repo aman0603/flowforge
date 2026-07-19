@@ -15,6 +15,7 @@ import (
 	"github.com/aman0603/flowforge/internal/recovery"
 	"github.com/aman0603/flowforge/internal/repository"
 	"github.com/aman0603/flowforge/internal/scheduler"
+	"github.com/aman0603/flowforge/internal/telemetry"
 	"github.com/aman0603/flowforge/internal/worker"
 )
 
@@ -24,6 +25,22 @@ func main() {
 	// 1. Generate/Determine Worker ID
 	workerID := getWorkerID()
 	log.Printf("[worker-%s] Initializing FlowForge Worker process...", workerID)
+
+	// 1.5 Initialize observability.
+	tel, err := telemetry.Init(telemetry.Config{
+		ServiceName:      cfg.OTelServiceName,
+		OTelDisabled:     cfg.OTelDisabled,
+		ExporterEndpoint: cfg.OTelExporterEndpoint,
+		MetricsAddr:      cfg.MetricsAddr,
+		LogLevel:         cfg.LogLevel,
+	})
+	if err != nil {
+		log.Fatalf("[worker-%s] Failed to initialize telemetry: %v", workerID, err)
+	}
+	if _, err := telemetry.InitMetrics(); err != nil {
+		log.Fatalf("[worker-%s] Failed to initialize metrics: %v", workerID, err)
+	}
+	defer telemetry.Shutdown(context.Background())
 
 	// 2. Connect to Database
 	repo, err := repository.New(cfg.DBURL)
@@ -149,6 +166,30 @@ func main() {
 	// 6. Signal-aware context for Graceful Shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 6.5 Bridge worker counters to Prometheus and serve /metrics.
+	if err := telemetry.RegisterWorkerMetrics(func() telemetry.WorkerCounters {
+		c := w.GetCounters()
+		return telemetry.WorkerCounters{
+			ActiveExecutions: c.ActiveExecutions,
+			QueuedTasks:      c.QueuedTasks,
+			TotalClaimed:     c.TotalClaimed,
+			TotalStarted:     c.TotalStarted,
+			TotalCompleted:   c.TotalCompleted,
+			TotalFailed:      c.TotalFailed,
+			TotalTimedOut:    c.TotalTimedOut,
+			TotalPanics:      c.TotalPanics,
+			TotalLeaseLosses: c.TotalLeaseLosses,
+		}
+	}); err != nil {
+		log.Printf("[worker-%s] Failed to register worker metrics: %v", workerID, err)
+	}
+	go func() {
+		log.Printf("[worker-%s] Serving metrics on %s/metrics", workerID, cfg.MetricsAddr)
+		if err := tel.ServeMetrics(ctx); err != nil {
+			log.Printf("[worker-%s] metrics server error: %v", workerID, err)
+		}
+	}()
 
 	// 7. Run Worker Loop
 	if err := w.Run(ctx); err != nil {

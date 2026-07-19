@@ -17,6 +17,9 @@ import (
 	"github.com/aman0603/flowforge/internal/proto/common"
 	health "github.com/aman0603/flowforge/internal/proto/health"
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/telemetry"
+	"github.com/aman0603/flowforge/internal/telemetry/httpmw"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Server represents the HTTP server.
@@ -46,6 +49,11 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /api/v1/runs/{run_id}/history", s.handleGetWorkflowRunHistory)
 	s.router.HandleFunc("GET /api/v1/tasks/{task_run_id}/attempts", s.handleGetTaskAttempts)
 	s.router.HandleFunc("GET /api/v1/dead-letter", s.handleGetDeadLetterTasks)
+
+	// Prometheus scrape endpoint (served from the telemetry registry).
+	if reg := telemetry.GetMetricsRegistry(); reg != nil {
+		s.router.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	}
 }
 
 // handleHealth responds with a JSON status OK.
@@ -145,7 +153,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf(":%s", s.cfg.Port)
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      s.router,
+		Handler:      httpmw.Middleware(s.router),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

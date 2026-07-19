@@ -10,6 +10,7 @@ import (
 	"github.com/aman0603/flowforge/internal/api"
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/telemetry"
 )
 
 func main() {
@@ -19,6 +20,21 @@ func main() {
 
 	// Load configuration
 	cfg := config.Load()
+
+	// Initialize observability (tracing/metrics/logging).
+	if _, err := telemetry.Init(telemetry.Config{
+		ServiceName:      cfg.OTelServiceName,
+		OTelDisabled:     cfg.OTelDisabled,
+		ExporterEndpoint: cfg.OTelExporterEndpoint,
+		MetricsAddr:      cfg.MetricsAddr,
+		LogLevel:         cfg.LogLevel,
+	}); err != nil {
+		log.Fatalf("Failed to initialize telemetry: %v", err)
+	}
+	if _, err := telemetry.InitMetrics(); err != nil {
+		log.Fatalf("Failed to initialize metrics: %v", err)
+	}
+	defer telemetry.Shutdown(context.Background())
 
 	// Initialize database repository
 	repo, err := repository.New(cfg.DBURL)

@@ -213,6 +213,17 @@ func Meter(name string) metric.Meter {
 	return metricnoop.NewMeterProvider().Meter(name)
 }
 
+// GetMetricsRegistry returns the global Prometheus registry, or nil if
+// telemetry has not been initialized.
+func GetMetricsRegistry() *promclient.Registry {
+	mu.RLock()
+	defer mu.RUnlock()
+	if globalTL != nil {
+		return globalTL.registry
+	}
+	return nil
+}
+
 // Shutdown flushes the global telemetry instance.
 func Shutdown(ctx context.Context) error {
 	mu.RLock()

@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/aman0603/flowforge/internal/telemetry/grpcmw"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -23,6 +24,7 @@ type Server struct {
 func NewServer(addr string, opts ...grpc.ServerOption) *Server {
 	base := []grpc.ServerOption{
 		grpc.Creds(insecure.NewCredentials()),
+		grpc.ChainUnaryInterceptor(grpcmw.UnaryServerInterceptor()),
 	}
 	opts = append(base, opts...)
 	return &Server{

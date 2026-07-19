@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/telemetry"
 )
 
 // Client abstracts the recovery operations the Worker depends on. Two
@@ -32,12 +33,22 @@ func NewLocalClient(repo *repository.Repository) *LocalClient {
 
 // RecoverTask routes to the correct guarded repository transition.
 func (c *LocalClient) RecoverTask(ctx context.Context, taskRunID string, status string, fencingToken int64) (bool, error) {
+	var (
+		reclaimed bool
+		err       error
+	)
 	switch status {
 	case "CLAIMED":
-		return c.repo.RecoverClaimedTask(ctx, taskRunID, fencingToken)
+		reclaimed, err = c.repo.RecoverClaimedTask(ctx, taskRunID, fencingToken)
 	case "RUNNING":
-		return c.repo.RecoverRunningTask(ctx, taskRunID, fencingToken)
+		reclaimed, err = c.repo.RecoverRunningTask(ctx, taskRunID, fencingToken)
 	default:
 		return false, fmt.Errorf("recovery: unsupported task status %q", status)
 	}
+	if reclaimed && err == nil {
+		if m := telemetry.GetMetrics(); m != nil {
+			m.TasksRecovered.Add(ctx, 1)
+		}
+	}
+	return reclaimed, err
 }
