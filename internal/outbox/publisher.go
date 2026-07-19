@@ -18,6 +18,7 @@ type OutboxRepo interface {
 	ClaimPendingOutboxEvents(ctx context.Context, publisherID string, batchSize int, claimTimeout time.Duration, now time.Time) ([]model.OutboxEvent, error)
 	MarkOutboxPublished(ctx context.Context, eventID, publisherID string, now time.Time) error
 	RecordOutboxError(ctx context.Context, eventID, publisherID, lastError string, attempts int, baseDelay time.Duration, maxRetries int, now time.Time) error
+	CleanupPublishedOutboxEvents(ctx context.Context, olderThan time.Time) (int64, error)
 }
 
 // Publisher polls the transactional outbox and publishes pending events to
@@ -33,6 +34,7 @@ type Publisher struct {
 	producer Producer
 	cfg      *config.Config
 	pubID    string
+	metrics  *Metrics
 
 	mu      sync.Mutex
 	stopped bool
@@ -40,13 +42,20 @@ type Publisher struct {
 	doneCh  chan struct{}
 }
 
-// NewPublisher constructs a Publisher.
+// NewPublisher constructs a Publisher. The metrics pointer may be nil if
+// observability is not required.
 func NewPublisher(repo OutboxRepo, producer Producer, cfg *config.Config) *Publisher {
+	return NewPublisherWithMetrics(repo, producer, cfg, &Metrics{})
+}
+
+// NewPublisherWithMetrics constructs a Publisher with a shared metrics sink.
+func NewPublisherWithMetrics(repo OutboxRepo, producer Producer, cfg *config.Config, metrics *Metrics) *Publisher {
 	return &Publisher{
 		repo:     repo,
 		producer: producer,
 		cfg:      cfg,
 		pubID:    fmt.Sprintf("%s-%d", cfg.KafkaClientID, time.Now().UnixNano()),
+		metrics:  metrics,
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
@@ -58,8 +67,11 @@ func NewPublisher(repo OutboxRepo, producer Producer, cfg *config.Config) *Publi
 func (p *Publisher) Run(ctx context.Context) {
 	defer close(p.doneCh)
 
-	ticker := time.NewTicker(p.cfg.OutboxPollInterval)
-	defer ticker.Stop()
+	pollTicker := time.NewTicker(p.cfg.OutboxPollInterval)
+	defer pollTicker.Stop()
+
+	cleanupTicker := time.NewTicker(p.cleanupInterval())
+	defer cleanupTicker.Stop()
 
 	for {
 		select {
@@ -67,10 +79,40 @@ func (p *Publisher) Run(ctx context.Context) {
 			return
 		case <-p.stopCh:
 			return
-		case <-ticker.C:
+		case <-pollTicker.C:
 			p.publishBatch(ctx)
+		case <-cleanupTicker.C:
+			p.runCleanup(ctx)
 		}
 	}
+}
+
+// cleanupInterval bounds how often published events are pruned. It is derived
+// from the retention window so cleanup runs at most a few times per retention
+// period.
+func (p *Publisher) cleanupInterval() time.Duration {
+	d := p.cfg.OutboxRetention / 12
+	if d < time.Minute {
+		d = time.Minute
+	}
+	return d
+}
+
+// runCleanup removes published events older than the retention window.
+func (p *Publisher) runCleanup(ctx context.Context) {
+	olderThan := time.Now().UTC().Add(-p.cfg.OutboxRetention)
+	removed, err := p.repo.CleanupPublishedOutboxEvents(ctx, olderThan)
+	if err != nil {
+		return
+	}
+	if removed > 0 {
+		p.metrics.recordCleanedUp(removed)
+	}
+}
+
+// Metrics returns a snapshot of the publisher's observability counters.
+func (p *Publisher) Metrics() Metrics {
+	return p.metrics.Snapshot()
 }
 
 // Stop signals the loop to stop and waits for in-flight work to finish.
@@ -123,6 +165,7 @@ func (p *Publisher) publishOne(ctx context.Context, e model.OutboxEvent) {
 
 	if err := p.producer.Publish(ctx, p.cfg.KafkaTopic, e.WorkflowRunID, value); err != nil {
 		_ = p.repo.RecordOutboxError(ctx, e.ID, p.pubID, err.Error(), e.Attempts, p.cfg.OutboxRetryBaseDelay, p.cfg.OutboxMaxRetries, time.Now().UTC())
+		p.metrics.recordFailure()
 		return
 	}
 
@@ -130,6 +173,7 @@ func (p *Publisher) publishOne(ctx context.Context, e model.OutboxEvent) {
 		// Already reclaimed or published: treat as acceptable duplicate.
 		return
 	}
+	p.metrics.recordPublished(1)
 }
 
 // envelopeFromEvent builds the external Kafka envelope from a stored outbox row.

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/outbox"
@@ -36,7 +37,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logf("Publisher started. Polling outbox every %s.", cfg.OutboxPollInterval)
+	logf("Publisher started. Polling outbox every %s, retention %s.", cfg.OutboxPollInterval, cfg.OutboxRetention)
+
+	// Periodic observability snapshot so operators can watch throughput and
+	// backlog without external tooling.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m := publisher.Metrics()
+				logf("metrics published=%d failed=%d retried=%d cleaned=%d",
+					m.Published, m.Failed, m.Retried, m.CleanedUp)
+			}
+		}
+	}()
 
 	publisher.Run(ctx)
 

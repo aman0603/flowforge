@@ -6,14 +6,14 @@ PostgreSQL is the durable source of truth for execution states, while Redis is u
 
 ---
 
-## Architecture Diagram (Current Phase 9 Status)
+## Architecture Diagram (Current Phase 10 Status)
 
 ```mermaid
 graph TD
     Client[Client / User] -->|HTTP/REST| API[API Server]
     API -->|Validate DAG| DAG[DAG Validator]
     API -->|Transactional Write| DB[(PostgreSQL)]
-    
+
     DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W1[Worker 1]
     DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W2[Worker 2]
 
@@ -24,6 +24,14 @@ graph TD
         direction TB
         W1 -->|Buffered Channel| WP1[Worker Goroutines 1..N]
         W2 -->|Buffered Channel| WP2[Worker Goroutines 1..N]
+    end
+
+    subgraph Event Streaming (Transactional Outbox)
+        direction TB
+        DB -->|outbox_events insert in same tx| OB[(outbox_events)]
+        OB -->|claim FOR UPDATE SKIP LOCKED| PUB[Publisher]
+        PUB -->|async publish| KAFKA[(Kafka)]
+        KAFKA -->|consumer groups| CON[Consumers]
     end
 ```
 
@@ -339,4 +347,75 @@ Phase 9 introduces high-performance concurrent worker pools, bounded capacity-aw
 * **Atomic Batch Claiming:** Ready tasks are claimed in batches using a single database transaction query utilizing a Common Table Expression (CTE). This ensures `FOR UPDATE SKIP LOCKED`, priority ranking, and FIFO tie-breaking are executed atomically.
 * **Panic Isolation:** Executor runtime panics are intercepted using Go's `recover()`, recorded as execution failures with a stack trace in the task attempt details, and isolated to prevent cascading crashes.
 * **Graceful Shutdown Drainage:** On context termination, the scheduler loop halts task claiming. The worker drains all queued tasks, transactionally returning them to `READY` status in PostgreSQL, while active executions are given up to `WORKER_SHUTDOWN_GRACE_PERIOD_MS` to finish execution. Context deadline cancellation terminates any tasks exceeding this grace period.
+
+---
+
+## Event Streaming & Outbox Operations (Phase 10)
+
+FlowForge publishes committed workflow events to Kafka using the transactional
+outbox pattern. PostgreSQL remains the durable source of truth; Kafka is only an
+asynchronous distribution channel.
+
+### Event flow
+
+```text
+Workflow State Change
+  -> Single PostgreSQL Transaction (state + outbox insert)
+  -> COMMIT
+  -> Publisher claims row (FOR UPDATE SKIP LOCKED, renewable lease)
+  -> Publisher writes to Kafka OUTSIDE the transaction
+  -> Publisher marks row published (conditional on claim token)
+```
+
+### Topic & ordering
+
+* Topic: `flowforge.workflow-events.v1` (configurable via `KAFKA_TOPIC`).
+* Message key: `workflow_run_id`, so events for a given run preserve order.
+* Each event carries a per-workflow monotonic `sequence`.
+
+### Delivery semantics
+
+* **At-least-once:** a crash between Kafka acknowledgement and the published
+  mark produces a duplicate. Consumers must be idempotent (dedupe by `event_id`).
+* Kafka outages never block workflow execution; events stay pending and are
+  retried on the next poll.
+* Publication failures reschedule the event with exponential backoff
+  (`OUTBOX_RETRY_BASE_DELAY`, capped at `OUTBOX_MAX_RETRIES`).
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker list |
+| `KAFKA_TOPIC` | `flowforge.workflow-events.v1` | Target topic |
+| `KAFKA_CLIENT_ID` | `flowforge-publisher` | Publisher/consumer-group ID |
+| `OUTBOX_POLL_INTERVAL` | `500ms` | Publisher poll cadence |
+| `OUTBOX_BATCH_SIZE` | `100` | Max events claimed per poll |
+| `OUTBOX_CLAIM_TIMEOUT` | `30s` | Lease duration for a claimed event |
+| `OUTBOX_MAX_RETRIES` | `5` | Retries before extended backoff |
+| `OUTBOX_RETRY_BASE_DELAY` | `1s` | Base exponential backoff |
+| `OUTBOX_RETENTION` | `24h` | Published-event retention before cleanup |
+
+### Running the publisher
+
+The publisher is a standalone process (`cmd/publisher`). In Docker Compose it
+runs as the `publisher` service; scale it independently:
+
+```bash
+docker compose up --build --scale publisher=2
+```
+
+### Consumer example
+
+`cmd/event-consumer` is a reference idempotent consumer. It subscribes via a
+consumer group, parses the versioned envelope, deduplicates by `event_id`,
+commits offsets only after processing, and safely skips malformed or unknown
+events.
+
+### Observability
+
+The publisher logs a metrics snapshot every 30s:
+`published`, `failed`, `retried`, `cleaned`. Watch `failed` and the outbox
+backlog (`published_at IS NULL` row count) to detect Kafka or publisher issues.
+
 

@@ -100,6 +100,19 @@ func (r *fakeRepo) RecordOutboxError(_ context.Context, eventID, _ string, _ str
 	return nil
 }
 
+func (r *fakeRepo) CleanupPublishedOutboxEvents(_ context.Context, _ time.Time) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var removed int64
+	for id, m := range r.marked {
+		if m {
+			delete(r.marked, id)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 func TestPublisherPublishesPendingEvents(t *testing.T) {
 	repo := newFakeRepo(
 		model.OutboxEvent{ID: "e1", WorkflowRunID: "w1", EventType: model.EventWorkflowStarted, Attempts: 0},
@@ -157,5 +170,41 @@ func TestEnvelopeFromEvent(t *testing.T) {
 	}
 	if env.TaskRunID == nil || *env.TaskRunID != taskID {
 		t.Fatalf("expected task run id preserved")
+	}
+}
+
+func TestPublisherRecordsMetrics(t *testing.T) {
+	repo := newFakeRepo(
+		model.OutboxEvent{ID: "e1", WorkflowRunID: "w1", EventType: model.EventWorkflowStarted, Attempts: 0},
+	)
+	producer := &fakeProducer{}
+	metrics := &Metrics{}
+	cfg := &config.Config{KafkaTopic: "t", KafkaClientID: "pub", OutboxPollInterval: time.Hour, OutboxBatchSize: 10, OutboxClaimTimeout: 30 * time.Second, OutboxMaxRetries: 5, OutboxRetryBaseDelay: time.Second, OutboxRetention: 24 * time.Hour}
+	pub := NewPublisherWithMetrics(repo, producer, cfg, metrics)
+
+	pub.publishBatch(context.Background())
+
+	if got := metrics.Snapshot().Published; got != 1 {
+		t.Fatalf("expected 1 published metric, got %d", got)
+	}
+	if got := metrics.Snapshot().Failed; got != 0 {
+		t.Fatalf("expected 0 failed metric, got %d", got)
+	}
+}
+
+func TestPublisherRecordsFailureMetric(t *testing.T) {
+	repo := newFakeRepo(model.OutboxEvent{ID: "e1", WorkflowRunID: "w1", EventType: model.EventWorkflowStarted, Attempts: 0})
+	producer := &fakeProducer{failTimes: 1}
+	metrics := &Metrics{}
+	cfg := &config.Config{KafkaTopic: "t", KafkaClientID: "pub", OutboxPollInterval: time.Hour, OutboxBatchSize: 10, OutboxClaimTimeout: 30 * time.Second, OutboxMaxRetries: 5, OutboxRetryBaseDelay: time.Second, OutboxRetention: 24 * time.Hour}
+	pub := NewPublisherWithMetrics(repo, producer, cfg, metrics)
+
+	pub.publishBatch(context.Background())
+
+	if got := metrics.Snapshot().Failed; got != 1 {
+		t.Fatalf("expected 1 failed metric, got %d", got)
+	}
+	if got := metrics.Snapshot().Published; got != 0 {
+		t.Fatalf("expected 0 published metric, got %d", got)
 	}
 }

@@ -25,14 +25,11 @@ Last reviewed: 2026-07-19 (Loop 4 complete)
 - [x] Loop 4: Implement the outbox publisher.
 - [x] Loop 5: Deploy the publisher as a standalone service.
 - [x] Loop 6: Add an idempotent consumer example.
-
-## In progress
-
-- [ ] Loop 7: Add retention, observability, and documentation.
+- [x] Loop 7: Add retention, observability, and documentation.
 
 ## Remaining
 
-- [ ] Run full integration and failure-injection tests.
+- [ ] Run full integration and failure-injection tests (covered by unit/integration tests added this phase; live Kafka E2E requires a running broker).
 - [ ] Loop 5: Deploy the publisher as a standalone service.
 - [ ] Loop 6: Add an idempotent consumer example.
 - [ ] Loop 7: Add retention, observability, and documentation.
