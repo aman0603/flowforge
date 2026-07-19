@@ -63,6 +63,7 @@ func Dial(ctx context.Context, addr string) (*grpc.ClientConn, error) {
 	defer cancel()
 	conn, err := grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(grpcmw.UnaryClientInterceptor()),
 		grpc.WithBlock(),
 	)
 	if err != nil {

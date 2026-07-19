@@ -9,7 +9,14 @@ import (
 
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/model"
+	"github.com/aman0603/flowforge/internal/telemetry"
+	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// correlationHeaderKey is the Kafka header carrying the correlation/request ID.
+const correlationHeaderKey = "x-request-id"
 
 // OutboxRepo is the repository surface the Publisher depends on. It is an
 // interface so the publisher can be exercised with a fake in unit tests while
@@ -163,11 +170,29 @@ func (p *Publisher) publishOne(ctx context.Context, e model.OutboxEvent) {
 		return
 	}
 
-	if err := p.producer.Publish(ctx, p.cfg.KafkaTopic, e.WorkflowRunID, value); err != nil {
+	pubCtx, span := telemetry.StartSpan(ctx, "kafka.publish "+p.cfg.KafkaTopic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", p.cfg.KafkaTopic),
+			attribute.String("event.id", e.ID),
+			attribute.String("event.type", e.EventType),
+		),
+	)
+
+	var headers []kafka.Header
+	telemetry.InjectContext(pubCtx, NewKafkaHeaderCarrier(&headers))
+	if cid := telemetry.CorrelationID(pubCtx); cid != "" {
+		headers = append(headers, kafka.Header{Key: correlationHeaderKey, Value: []byte(cid)})
+	}
+
+	if err := p.producer.Publish(pubCtx, p.cfg.KafkaTopic, e.WorkflowRunID, value, headers...); err != nil {
+		telemetry.EndSpan(span, err)
 		_ = p.repo.RecordOutboxError(ctx, e.ID, p.pubID, err.Error(), e.Attempts, p.cfg.OutboxRetryBaseDelay, p.cfg.OutboxMaxRetries, time.Now().UTC())
 		p.metrics.recordFailure()
 		return
 	}
+	span.End()
 
 	if err := p.repo.MarkOutboxPublished(ctx, e.ID, p.pubID, time.Now().UTC()); err != nil {
 		// Already reclaimed or published: treat as acceptable duplicate.

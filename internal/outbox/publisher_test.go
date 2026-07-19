@@ -9,17 +9,19 @@ import (
 
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/model"
+	"github.com/segmentio/kafka-go"
 )
 
 // fakeProducer records published messages and can be configured to fail.
 type fakeProducer struct {
-	mu        sync.Mutex
-	published [][]byte
-	failTimes int
-	calls     int
+	mu          sync.Mutex
+	published   [][]byte
+	lastHeaders []kafka.Header
+	failTimes   int
+	calls       int
 }
 
-func (f *fakeProducer) Publish(_ context.Context, _ string, _ string, value []byte) error {
+func (f *fakeProducer) Publish(_ context.Context, _ string, _ string, value []byte, headers ...kafka.Header) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -30,6 +32,7 @@ func (f *fakeProducer) Publish(_ context.Context, _ string, _ string, value []by
 	cp := make([]byte, len(value))
 	copy(cp, value)
 	f.published = append(f.published, cp)
+	f.lastHeaders = headers
 	return nil
 }
 

@@ -12,7 +12,7 @@ import (
 // Implementations must be safe for concurrent use and must not publish inside a
 // PostgreSQL transaction.
 type Producer interface {
-	Publish(ctx context.Context, topic, key string, value []byte) error
+	Publish(ctx context.Context, topic, key string, value []byte, headers ...kafka.Header) error
 	Close() error
 }
 
@@ -38,14 +38,15 @@ func NewKafkaProducer(cfg *config.Config) *KafkaProducer {
 
 // Publish writes a message to Kafka with the workflow_run_id as the key to
 // preserve per-workflow ordering.
-func (p *KafkaProducer) Publish(ctx context.Context, topic, key string, value []byte) error {
+func (p *KafkaProducer) Publish(ctx context.Context, topic, key string, value []byte, headers ...kafka.Header) error {
 	if topic == "" {
 		topic = p.writer.Topic
 	}
 	msg := kafka.Message{
-		Topic: topic,
-		Key:   []byte(key),
-		Value: value,
+		Topic:   topic,
+		Key:     []byte(key),
+		Value:   value,
+		Headers: headers,
 	}
 	if err := p.writer.WriteMessages(ctx, msg); err != nil {
 		return fmt.Errorf("failed to write kafka message: %w", err)

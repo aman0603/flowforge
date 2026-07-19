@@ -10,6 +10,9 @@ import (
 	"github.com/aman0603/flowforge/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // correlationHeader is the HTTP header carrying the request/correlation ID.
@@ -33,23 +36,41 @@ func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
+		// Extract any inbound trace context (W3C traceparent) so this request
+		// becomes a child of an upstream trace.
+		ctx := telemetry.ExtractContext(r.Context(), propagation.HeaderCarrier(r.Header))
+
 		// Correlation ID: reuse incoming header or mint a new one.
 		cid := r.Header.Get(correlationHeader)
 		if cid == "" {
 			cid = telemetry.NewCorrelationID()
 		}
-		ctx := telemetry.WithCorrelationID(r.Context(), cid)
+		ctx = telemetry.WithCorrelationID(ctx, cid)
 		w.Header().Set(correlationHeader, cid)
+
+		// Server span for the request.
+		route := routePattern(r)
+		ctx, span := telemetry.StartSpan(ctx, "HTTP "+r.Method+" "+route,
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(
+				semconv.HTTPRequestMethodKey.String(r.Method),
+				semconv.HTTPRoute(route),
+				attribute.String("request_id", cid),
+			),
+		)
+		defer span.End()
 
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r.WithContext(ctx))
+
+		span.SetAttributes(semconv.HTTPResponseStatusCode(rec.status))
 
 		if m == nil {
 			return
 		}
 		attrs := metric.WithAttributes(
 			attribute.String("method", r.Method),
-			attribute.String("path", routePattern(r)),
+			attribute.String("path", route),
 			attribute.String("status", strconv.Itoa(rec.status)),
 		)
 		m.HTTPRequests.Add(ctx, 1, attrs)
