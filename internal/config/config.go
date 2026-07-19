@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,15 @@ type Config struct {
 	WorkerQueueCapacity     int
 	WorkerClaimBatchSize    int
 	WorkerShutdownGrace     time.Duration
+	KafkaBrokers            []string
+	KafkaTopic              string
+	KafkaClientID           string
+	OutboxPollInterval      time.Duration
+	OutboxBatchSize         int
+	OutboxClaimTimeout      time.Duration
+	OutboxMaxRetries        int
+	OutboxRetryBaseDelay    time.Duration
+	OutboxRetention         time.Duration
 }
 
 // Load reads configuration from environment variables with fallback defaults.
@@ -55,6 +65,42 @@ func Load() *Config {
 		panic("invalid configuration: WORKER_CLAIM_BATCH_SIZE must be greater than 0")
 	}
 
+	kafkaBrokersStr := getEnv("KAFKA_BROKERS", "localhost:9092")
+	var kafkaBrokers []string
+	if kafkaBrokersStr != "" {
+		kafkaBrokers = strings.Split(kafkaBrokersStr, ",")
+	}
+
+	batchSizeOutbox, _ := strconv.Atoi(getEnv("OUTBOX_BATCH_SIZE", "100"))
+	if batchSizeOutbox <= 0 {
+		batchSizeOutbox = 100
+	}
+
+	maxRetriesOutbox, _ := strconv.Atoi(getEnv("OUTBOX_MAX_RETRIES", "5"))
+	if maxRetriesOutbox < 0 {
+		maxRetriesOutbox = 5
+	}
+
+	pollInterval, err := time.ParseDuration(getEnv("OUTBOX_POLL_INTERVAL", "500ms"))
+	if err != nil {
+		pollInterval = 500 * time.Millisecond
+	}
+
+	claimTimeout, err := time.ParseDuration(getEnv("OUTBOX_CLAIM_TIMEOUT", "30s"))
+	if err != nil {
+		claimTimeout = 30 * time.Second
+	}
+
+	retryBaseDelay, err := time.ParseDuration(getEnv("OUTBOX_RETRY_BASE_DELAY", "1s"))
+	if err != nil {
+		retryBaseDelay = 1 * time.Second
+	}
+
+	retention, err := time.ParseDuration(getEnv("OUTBOX_RETENTION", "24h"))
+	if err != nil {
+		retention = 24 * time.Hour
+	}
+
 	return &Config{
 		Port:                    getEnv("PORT", "8080"),
 		DBURL:                   getEnv("DB_URL", "postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"),
@@ -71,6 +117,15 @@ func Load() *Config {
 		WorkerQueueCapacity:     queueCapacity,
 		WorkerClaimBatchSize:    batchSize,
 		WorkerShutdownGrace:     time.Duration(graceMs) * time.Millisecond,
+		KafkaBrokers:            kafkaBrokers,
+		KafkaTopic:              getEnv("KAFKA_TOPIC", "flowforge.workflow-events.v1"),
+		KafkaClientID:           getEnv("KAFKA_CLIENT_ID", "flowforge-publisher"),
+		OutboxPollInterval:      pollInterval,
+		OutboxBatchSize:         batchSizeOutbox,
+		OutboxClaimTimeout:      claimTimeout,
+		OutboxMaxRetries:        maxRetriesOutbox,
+		OutboxRetryBaseDelay:    retryBaseDelay,
+		OutboxRetention:         retention,
 	}
 }
 

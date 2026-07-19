@@ -179,6 +179,17 @@ export REDIS_ADDR="localhost:6379"
 export PORT="8080"
 export SCHEMA_PATH="schema.sql"
 
+# Kafka & Outbox configurations
+export KAFKA_BROKERS="localhost:9092"
+export KAFKA_TOPIC="flowforge.workflow-events.v1"
+export KAFKA_CLIENT_ID="flowforge-publisher"
+export OUTBOX_POLL_INTERVAL="500ms"
+export OUTBOX_BATCH_SIZE="100"
+export OUTBOX_CLAIM_TIMEOUT="30s"
+export OUTBOX_MAX_RETRIES="5"
+export OUTBOX_RETRY_BASE_DELAY="1s"
+export OUTBOX_RETENTION="24h"
+
 # Run the server
 go run cmd/flowforge/main.go
 

@@ -29,6 +29,32 @@ services:
       timeout: 3s
       retries: 10
 
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: flowforge-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build:
       context: .
@@ -42,10 +68,15 @@ services:
       ENV: "development"
       SCHEMA_PATH: "schema.sql"
       REDIS_ADDR: "redis:6379"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_TOPIC: "flowforge.workflow-events.v1"
+      KAFKA_CLIENT_ID: "flowforge-app"
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
 
   worker:
@@ -68,10 +99,15 @@ services:
       WORKER_QUEUE_CAPACITY: "${WORKER_QUEUE_CAPACITY:-32}"
       WORKER_CLAIM_BATCH_SIZE: "${WORKER_CLAIM_BATCH_SIZE:-8}"
       WORKER_SHUTDOWN_GRACE_PERIOD_MS: "${WORKER_SHUTDOWN_GRACE_PERIOD_MS:-10000}"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_TOPIC: "flowforge.workflow-events.v1"
+      KAFKA_CLIENT_ID: "flowforge-worker"
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
 
 volumes:
