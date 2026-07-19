@@ -33,6 +33,8 @@ graph TD
 
 * **`cmd/flowforge/`**: Entry point of the application containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/flowforge/main.go), bootstrapping the database and the HTTP server.
 * **`cmd/worker/`**: Entry point of the worker process containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/worker/main.go).
+* **`cmd/publisher/`**: Standalone outbox publisher process that relays committed `outbox_events` rows to Kafka.
+* **`internal/outbox/`**: Outbox publisher and Kafka producer adapter.
 * **`internal/api/`**: The web service layers containing [server.go](file:///home/amanpaswan/aman/flowforge/internal/api/server.go), implementing routes using Go's native HTTP muxer and handling requests/responses.
 * **`internal/config/`**: Configuration loading in [config.go](file:///home/amanpaswan/aman/flowforge/internal/config/config.go) using environment variables.
 * **`internal/dag/`**: Core graph validation logic in [dag.go](file:///home/amanpaswan/aman/flowforge/internal/dag/dag.go) to detect circular dependencies before persisting workflows.
@@ -159,15 +161,22 @@ Queries the execution progress and state of all task runs for a given workflow r
 ## How to Run & Build
 
 ### Using Docker (Recommended)
-We use Docker Compose to manage PostgreSQL, Redis, the API server, and 3 workers.
+We use Docker Compose to manage PostgreSQL, Redis, Kafka, the API server, workers, and the outbox publisher.
 
 ```bash
-# Start all containers in the foreground with 3 concurrent workers
-docker compose up --build --scale worker=3
+# Start all containers in the foreground with 3 concurrent workers and 2 publishers
+docker compose up --build --scale worker=3 --scale publisher=2
 
 # Shutdown and clean volumes
 docker compose down -v
 ```
+
+The `publisher` service runs as a standalone process. It polls the
+`outbox_events` table, publishes committed workflow events to Kafka, and marks
+them published. It does not embed into workers and never requires Redis. Kafka
+outages do not block workflow execution; pending events are retried on the next
+poll. Multiple publisher replicas are safe because claims use `FOR UPDATE SKIP
+LOCKED` with a per-instance lease.
 
 ### Running Locally (Without Docker)
 Make sure you have running PostgreSQL and Redis instances, and specify configuration via environment variables:

@@ -23,14 +23,15 @@ Last reviewed: 2026-07-19 (Loop 4 complete)
 - [x] Loop 2: Insert events atomically with repository transitions.
 - [x] Loop 3: Add Kafka configuration and Docker Compose infrastructure.
 - [x] Loop 4: Implement the outbox publisher.
+- [x] Loop 5: Deploy the publisher as a standalone service.
 
 ## In progress
 
-- [ ] Loop 5: Deploy the publisher as a standalone service.
+- [ ] Loop 6: Add an idempotent consumer example.
 
 ## Remaining
 
-- [ ] Loop 6: Add an idempotent consumer example.
+- [ ] Loop 7: Add retention, observability, and documentation.
 - [ ] Loop 5: Deploy the publisher as a standalone service.
 - [ ] Loop 6: Add an idempotent consumer example.
 - [ ] Loop 7: Add retention, observability, and documentation.

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:16-alpine
@@ -106,6 +104,28 @@ services:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["./publisher"]
+    environment:
+      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      KAFKA_BROKERS: "kafka:29092"
+      KAFKA_TOPIC: "flowforge.workflow-events.v1"
+      KAFKA_CLIENT_ID: "flowforge-publisher"
+      OUTBOX_POLL_INTERVAL: "${OUTBOX_POLL_INTERVAL:-500ms}"
+      OUTBOX_BATCH_SIZE: "${OUTBOX_BATCH_SIZE:-100}"
+      OUTBOX_CLAIM_TIMEOUT: "${OUTBOX_CLAIM_TIMEOUT:-30s}"
+      OUTBOX_MAX_RETRIES: "${OUTBOX_MAX_RETRIES:-5}"
+      OUTBOX_RETRY_BASE_DELAY: "${OUTBOX_RETRY_BASE_DELAY:-1s}"
+      OUTBOX_RETENTION: "${OUTBOX_RETENTION:-24h}"
+    depends_on:
+      db:
         condition: service_healthy
       kafka:
         condition: service_healthy
