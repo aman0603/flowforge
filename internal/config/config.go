@@ -28,6 +28,8 @@ type Config struct {
 	KafkaBrokers            []string
 	KafkaTopic              string
 	KafkaClientID           string
+	SchedulerAddr           string
+	RecoveryAddr            string
 	OutboxPollInterval      time.Duration
 	OutboxBatchSize         int
 	OutboxClaimTimeout      time.Duration
@@ -122,6 +124,8 @@ func Load() *Config {
 		KafkaBrokers:            kafkaBrokers,
 		KafkaTopic:              getEnv("KAFKA_TOPIC", "flowforge.workflow-events.v1"),
 		KafkaClientID:           getEnv("KAFKA_CLIENT_ID", "flowforge-publisher"),
+		SchedulerAddr:           getEnv("SCHEDULER_ADDR", ""),
+		RecoveryAddr:            getEnv("RECOVERY_ADDR", ""),
 		OutboxPollInterval:      pollInterval,
 		OutboxBatchSize:         batchSizeOutbox,
 		OutboxClaimTimeout:      claimTimeout,

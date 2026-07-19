@@ -11,6 +11,7 @@ import (
 
 	"github.com/aman0603/flowforge/internal/model"
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/scheduler"
 )
 
 type fakeRepository struct {
@@ -236,8 +237,23 @@ func (f *fakeCoordinator) Close() error {
 	return nil
 }
 
+// fakeScheduler is a no-op scheduler.Client for worker unit tests that do not
+// exercise the claiming/promotion path.
+type fakeScheduler struct{}
+
+func (fakeScheduler) ClaimTasks(context.Context, string, int) ([]*model.ClaimedTask, error) {
+	return nil, nil
+}
+
+func (fakeScheduler) PromoteRetries(context.Context) (int64, error) {
+	return 0, nil
+}
+
+// Ensure fakeScheduler satisfies the scheduler.Client interface.
+var _ scheduler.Client = fakeScheduler{}
+
 func newTestWorker(id string, repo Repository, executors map[string]Executor, pollInterval time.Duration) *Worker {
-	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0, 1, 2, 1, 500*time.Millisecond)
+	return New(id, repo, executors, pollInterval, 0, 0, 0, &fakeCoordinator{}, 0, 0, 0, 0, 1, 2, 1, 500*time.Millisecond, fakeScheduler{})
 }
 
 type fakeExecutor struct {
@@ -580,6 +596,7 @@ func TestWorkerPoolConcurrencyAndPanics(t *testing.T) {
 			0, 0, 0, 0,
 			2, 4, 2, // poolSize=2, queueCapacity=4, batchSize=2
 			500*time.Millisecond,
+			fakeScheduler{},
 		)
 
 		err := w.Run(ctx)

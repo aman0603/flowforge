@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package flowforge.scheduler;
+
+option go_package = "github.com/aman0603/flowforge/internal/proto/scheduler;scheduler";
+
+import "flowforge/common.proto";
+
+// ClaimedTask is the transport model for a task claimed by the scheduler.
+// It intentionally does not expose the full DB row.
+message ClaimedTask {
+  string task_run_id = 1;
+  string workflow_run_id = 2;
+  string task_definition_id = 3;
+  string name = 4;
+  string task_type = 5;
+  int64 timeout_ms = 6;
+  int64 fencing_token = 7;
+  bytes input = 8;
+}
+
+// ClaimTasksRequest asks the scheduler to claim up to `capacity` READY tasks
+// for the given worker.
+message ClaimTasksRequest {
+  string worker_id = 1;
+  int32 capacity = 2;
+}
+
+// ClaimTasksResponse returns the claimed tasks.
+message ClaimTasksResponse {
+  repeated ClaimedTask tasks = 1;
+  flowforge.common.ErrorDetail error = 2;
+}
+
+// PromoteRetriesRequest triggers promotion of due RETRY_WAIT tasks to READY.
+message PromoteRetriesRequest {}
+
+// PromoteRetriesResponse reports how many tasks were promoted.
+message PromoteRetriesResponse {
+  int64 promoted = 1;
+  flowforge.common.ErrorDetail error = 2;
+}
+
+// SchedulerService owns batch claiming and retry promotion. It does NOT execute
+// tasks. It is called synchronously by the Worker service over gRPC.
+service SchedulerService {
+  rpc ClaimTasks(ClaimTasksRequest) returns (ClaimTasksResponse);
+  rpc PromoteRetries(PromoteRetriesRequest) returns (PromoteRetriesResponse);
+}

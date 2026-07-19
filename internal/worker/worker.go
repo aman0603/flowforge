@@ -12,6 +12,7 @@ import (
 
 	"github.com/aman0603/flowforge/internal/model"
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/scheduler"
 )
 
 // Repository defines the subset of repository methods required by the worker.
@@ -44,6 +45,7 @@ type SchedulerCounters struct {
 type Worker struct {
 	id                  string
 	repo                Repository
+	sched               scheduler.Client
 	executors           map[string]Executor
 	pollInterval        time.Duration
 	claimedStaleTimeout time.Duration
@@ -73,7 +75,11 @@ type Worker struct {
 	counters *SchedulerCounters
 }
 
-// New creates a new Worker instance.
+// New creates a new Worker instance. The scheduler client is chosen based on
+// cfg.SchedulerAddr: when set, claims/promotion go over gRPC to a standalone
+// Scheduler service; otherwise they use the repository directly (the modular
+// monolith default). A non-empty SchedulerAddr that cannot be dialed is a
+// fatal configuration error so misconfiguration is caught at startup.
 func New(
 	id string,
 	repo Repository,
@@ -91,6 +97,7 @@ func New(
 	queueCapacity int,
 	batchSize int,
 	shutdownGrace time.Duration,
+	sched scheduler.Client,
 ) *Worker {
 	if pollInterval <= 0 {
 		pollInterval = 1 * time.Second
@@ -135,6 +142,7 @@ func New(
 	return &Worker{
 		id:                  id,
 		repo:                repo,
+		sched:               sched,
 		executors:           executors,
 		pollInterval:        pollInterval,
 		claimedStaleTimeout: claimedStaleTimeout,
@@ -338,7 +346,7 @@ func (w *Worker) runRecoveryIteration(ctx context.Context) {
 			w.id, claimedRecovered, runningRecovered)
 	}
 
-	promoted, err := w.repo.PromoteDueRetries(ctx)
+	promoted, err := w.sched.PromoteRetries(ctx)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			log.Printf("[worker-%s] ERROR promoting due retries: %v", w.id, err)
@@ -371,7 +379,7 @@ func (w *Worker) schedulerLoop(ctx context.Context) error {
 				limit = w.batchSize
 			}
 
-			claimed, err := w.repo.ClaimReadyTasksBatch(ctx, w.id, limit)
+			claimed, err := w.sched.ClaimTasks(ctx, w.id, limit)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					log.Printf("[worker-%s] Scheduler batch claim database error: %v", w.id, err)

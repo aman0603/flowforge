@@ -12,6 +12,6 @@ protoc \
   --proto_path=proto \
   --go_out=internal/proto --go_opt=module=github.com/aman0603/flowforge/internal/proto \
   --go-grpc_out=internal/proto --go-grpc_opt=module=github.com/aman0603/flowforge/internal/proto \
-  flowforge/common.proto flowforge/health.proto
+  flowforge/common.proto flowforge/health.proto flowforge/scheduler.proto
 
 echo "proto generated"

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aman0603/flowforge/internal/config"
 	"github.com/aman0603/flowforge/internal/repository"
+	"github.com/aman0603/flowforge/internal/scheduler"
 	"github.com/aman0603/flowforge/internal/worker"
 )
 
@@ -79,6 +80,23 @@ func main() {
 		"SLEEP": worker.NewSleepExecutor(),
 	}
 
+	// 5.6 Choose scheduler client: gRPC when SCHEDULER_ADDR is set, else local.
+	var sched scheduler.Client
+	if cfg.SchedulerAddr != "" {
+		sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+		grpcSched, err := scheduler.NewGRPCClient(sctx, cfg.SchedulerAddr)
+		scancel()
+		if err != nil {
+			log.Fatalf("[worker-%s] Failed to connect to scheduler at %s: %v", workerID, cfg.SchedulerAddr, err)
+		}
+		defer grpcSched.Close()
+		sched = grpcSched
+		log.Printf("[worker-%s] Using remote scheduler at %s", workerID, cfg.SchedulerAddr)
+	} else {
+		sched = scheduler.NewLocalClient(repo)
+		log.Printf("[worker-%s] Using local (in-process) scheduler", workerID)
+	}
+
 	// 6. Construct Worker
 	w := worker.New(
 		workerID,
@@ -97,6 +115,7 @@ func main() {
 		cfg.WorkerQueueCapacity,
 		cfg.WorkerClaimBatchSize,
 		cfg.WorkerShutdownGrace,
+		sched,
 	)
 
 	// 6. Signal-aware context for Graceful Shutdown
