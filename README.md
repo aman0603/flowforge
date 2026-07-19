@@ -6,7 +6,7 @@ PostgreSQL is the durable source of truth for execution states, while Redis is u
 
 ---
 
-## Architecture Diagram (Current Phase 10 Status)
+## Architecture Diagram (Current Phase 11 Status)
 
 ```mermaid
 graph TD
@@ -14,8 +14,16 @@ graph TD
     API -->|Validate DAG| DAG[DAG Validator]
     API -->|Transactional Write| DB[(PostgreSQL)]
 
+    Sched[Scheduler gRPC Service] -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| DB
+    Recov[Recovery gRPC Service] -->|Stale Task Reset| DB
+
     DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W1[Worker 1]
     DB -->|Atomic Batch Claim FOR UPDATE SKIP LOCKED| W2[Worker 2]
+
+    W1 -->|gRPC ClaimTasks / PromoteRetries| Sched
+    W2 -->|gRPC ClaimTasks / PromoteRetries| Sched
+    W1 -->|gRPC RecoverTask| Recov
+    W2 -->|gRPC RecoverTask| Recov
 
     W1 <-->|Heartbeats & Leases| Redis[(Redis)]
     W2 <-->|Heartbeats & Leases| Redis
@@ -41,6 +49,8 @@ graph TD
 
 * **`cmd/flowforge/`**: Entry point of the application containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/flowforge/main.go), bootstrapping the database and the HTTP server.
 * **`cmd/worker/`**: Entry point of the worker process containing [main.go](file:///home/amanpaswan/aman/flowforge/cmd/worker/main.go).
+* **`cmd/scheduler/`**: Standalone gRPC Scheduler service (ClaimTasks / PromoteRetries). Workers use it when `SCHEDULER_ADDR` is set; otherwise they call the scheduler in-process.
+* **`cmd/recovery/`**: Standalone gRPC Recovery service (RecoverTask for stale-task reset). Workers use it when `RECOVERY_ADDR` is set; otherwise they recover in-process.
 * **`cmd/publisher/`**: Standalone outbox publisher process that relays committed `outbox_events` rows to Kafka.
 * **`internal/outbox/`**: Outbox publisher and Kafka producer adapter.
 * **`internal/api/`**: The web service layers containing [server.go](file:///home/amanpaswan/aman/flowforge/internal/api/server.go), implementing routes using Go's native HTTP muxer and handling requests/responses.
@@ -166,6 +176,19 @@ Queries the execution progress and state of all task runs for a given workflow r
 
 ---
 
+## Phase 11: gRPC-Based Internal Service Communication
+
+The scheduling and recovery responsibilities previously run in-process inside every worker are now available as standalone gRPC services (`cmd/scheduler`, `cmd/recovery`). Workers call them over gRPC when their addresses are configured; otherwise they fall back to the original in-process behavior, so existing deployments are unchanged until opted in.
+
+* **Scheduler service** exposes `ClaimTasks` and `PromoteRetries`. When `SCHEDULER_ADDR` is set, a worker dials this service instead of touching PostgreSQL directly for claiming/promotion.
+* **Recovery service** exposes `RecoverTask`. When `RECOVERY_ADDR` is set, a worker delegates the stale-task DB transition to this service while keeping the Redis lease gate local.
+* **Transport**: insecure (plaintext) gRPC is used for internal network traffic. Each service also exposes the gRPC Health protocol; the gRPC client applies per-attempt deadlines, exponential backoff on retryable codes (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `DEADLINE_EXCEEDED`, `ABORTED`, `INTERNAL`), and maps server errors to the `common.ErrorCode` contract.
+* **Opt-in config**: `SCHEDULER_ADDR`, `RECOVERY_ADDR`, `GRPC_RETRY_MAX_ATTEMPTS`, `GRPC_RETRY_BASE_DELAY`, `GRPC_REQUEST_TIMEOUT`.
+
+The `docker-compose.yml` now defines `scheduler` (port `9091:9090`) and `recovery` (port `9092:9090`) services and points the `worker` at them via `SCHEDULER_ADDR=scheduler:9090` and `RECOVERY_ADDR=recovery:9090`. Protobuf definitions live in `proto/flowforge/` and regenerate via `scripts/gen-proto.sh`.
+
+---
+
 ## How to Run & Build
 
 ### Using Docker (Recommended)
@@ -206,6 +229,13 @@ export OUTBOX_CLAIM_TIMEOUT="30s"
 export OUTBOX_MAX_RETRIES="5"
 export OUTBOX_RETRY_BASE_DELAY="1s"
 export OUTBOX_RETENTION="24h"
+
+# gRPC internal services (optional; omit to keep scheduler/recovery in-process)
+export SCHEDULER_ADDR="localhost:9091"
+export RECOVERY_ADDR="localhost:9092"
+export GRPC_RETRY_MAX_ATTEMPTS="3"
+export GRPC_RETRY_BASE_DELAY="50ms"
+export GRPC_REQUEST_TIMEOUT="5s"
 
 # Run the server
 go run cmd/flowforge/main.go
