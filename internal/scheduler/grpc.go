@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/aman0603/flowforge/internal/grpcutil"
 	"github.com/aman0603/flowforge/internal/model"
 	pbsched "github.com/aman0603/flowforge/internal/proto/scheduler"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // GRPCClient implements Client by calling a standalone Scheduler gRPC service.
@@ -30,12 +28,7 @@ func NewGRPCClient(ctx context.Context, addr string, opts ...*grpcutil.CallOptio
 	if len(opts) > 0 && opts[0] != nil {
 		callOpts = *opts[0]
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(dialCtx, addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
+	conn, err := grpcutil.DialTLS(ctx, addr, grpcutil.TLSConfigFromEnv())
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial scheduler at %s: %w", addr, err)
 	}

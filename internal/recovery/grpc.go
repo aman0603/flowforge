@@ -3,12 +3,10 @@ package recovery
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/aman0603/flowforge/internal/grpcutil"
 	pbrecov "github.com/aman0603/flowforge/internal/proto/recovery"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // GRPCClient implements Client by calling a standalone Recovery gRPC service.
@@ -28,12 +26,7 @@ func NewGRPCClient(ctx context.Context, addr string, opts ...*grpcutil.CallOptio
 	if len(opts) > 0 && opts[0] != nil {
 		callOpts = *opts[0]
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(dialCtx, addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
+	conn, err := grpcutil.DialTLS(ctx, addr, grpcutil.TLSConfigFromEnv())
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial recovery at %s: %w", addr, err)
 	}

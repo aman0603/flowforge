@@ -18,9 +18,9 @@ type Server struct {
 	addr   string
 }
 
-// NewServer constructs a gRPC Server listening on addr. Interceptors can be
-// supplied via opts; a sensible default uses plaintext (insecure) credentials
-// for internal, same-network communication. TLS is a future hardening step.
+// NewServer constructs a gRPC Server listening on addr using insecure
+// credentials (plaintext) for internal same-network communication. Interceptors
+// can be supplied via opts. For transport security use NewServerTLS.
 func NewServer(addr string, opts ...grpc.ServerOption) *Server {
 	base := []grpc.ServerOption{
 		grpc.Creds(insecure.NewCredentials()),
@@ -31,6 +31,26 @@ func NewServer(addr string, opts ...grpc.ServerOption) *Server {
 		server: grpc.NewServer(opts...),
 		addr:   addr,
 	}
+}
+
+// NewServerTLS constructs a gRPC Server applying the supplied TLSConfig. When
+// TLS is disabled it is equivalent to NewServer (insecure). When enabled it
+// installs the server credentials; a misconfiguration returns an error rather
+// than silently downgrading security.
+func NewServerTLS(addr string, tlsCfg TLSConfig, opts ...grpc.ServerOption) (*Server, error) {
+	creds, err := tlsCfg.ServerCredentials()
+	if err != nil {
+		return nil, fmt.Errorf("grpc server credentials: %w", err)
+	}
+	base := []grpc.ServerOption{
+		grpc.Creds(creds),
+		grpc.ChainUnaryInterceptor(grpcmw.UnaryServerInterceptor()),
+	}
+	opts = append(base, opts...)
+	return &Server{
+		server: grpc.NewServer(opts...),
+		addr:   addr,
+	}, nil
 }
 
 // Server returns the underlying *grpc.Server so callers can register services.
@@ -59,10 +79,21 @@ func (s *Server) Stop() {
 // Dial connects to a FlowForge gRPC service at addr using insecure credentials.
 // Callers are responsible for closing the returned *grpc.ClientConn.
 func Dial(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	return DialTLS(ctx, addr, TLSConfig{})
+}
+
+// DialTLS connects to a FlowForge gRPC service at addr, applying the supplied
+// TLSConfig. When TLS is disabled it uses insecure credentials (same as Dial).
+// Callers are responsible for closing the returned *grpc.ClientConn.
+func DialTLS(ctx context.Context, addr string, tlsCfg TLSConfig) (*grpc.ClientConn, error) {
+	creds, err := tlsCfg.ClientCredentials()
+	if err != nil {
+		return nil, fmt.Errorf("grpc client credentials: %w", err)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	conn, err := grpc.DialContext(ctx, addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithChainUnaryInterceptor(grpcmw.UnaryClientInterceptor()),
 		grpc.WithBlock(),
 	)

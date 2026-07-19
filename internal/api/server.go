@@ -69,6 +69,15 @@ func (s *Server) registerRoutes() {
 	}
 }
 
+// maxBodyBytes returns the configured request body size limit, falling back to
+// 1 MiB when unset (e.g. in tests constructing a bare config).
+func (s *Server) maxBodyBytes() int64 {
+	if s.cfg != nil && s.cfg.MaxRequestBodyBytes > 0 {
+		return s.cfg.MaxRequestBodyBytes
+	}
+	return 1 << 20
+}
+
 // handleHealth responds with a JSON status OK.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -105,6 +114,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateDefinition handles POST /definitions.
 func (s *Server) handleCreateDefinition(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes())
 	var req model.CreateDefinitionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body", err)
@@ -129,6 +139,7 @@ func (s *Server) handleCreateDefinition(w http.ResponseWriter, r *http.Request) 
 
 // handleCreateRun handles POST /runs.
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes())
 	var req model.CreateRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body", err)
@@ -193,9 +204,10 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string, e
 // Start runs the HTTP server.
 func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf(":%s", s.cfg.Port)
+	handler := httpmw.RateLimit(httpmw.Middleware(s.router), s.cfg.RateLimitRPS, s.cfg.RateLimitBurst)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           httpmw.Middleware(s.router),
+		Handler:           handler,
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -208,7 +220,15 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start the gRPC server on its own address, exposing internal RPC
 	// contracts (Phase 11) alongside the unchanged REST API.
 	grpcErrChan := make(chan error, 1)
-	grpcSrv := grpcutil.NewServer(s.cfg.GRPCAddr)
+	grpcSrv, err := grpcutil.NewServerTLS(s.cfg.GRPCAddr, grpcutil.TLSConfig{
+		Enabled:  s.cfg.GRPCTLSEnabled,
+		CertFile: s.cfg.GRPCTLSCertFile,
+		KeyFile:  s.cfg.GRPCTLSKeyFile,
+		CAFile:   s.cfg.GRPCTLSCAFile,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create gRPC server: %w", err)
+	}
 	health.RegisterHealthServiceServer(grpcSrv.Server(), grpcutil.NewHealthServer(&apiHealthChecker{repo: s.repo}))
 	go func() {
 		log.Printf("Starting gRPC server on %s", s.cfg.GRPCAddr)

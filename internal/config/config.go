@@ -38,6 +38,13 @@ type Config struct {
 	GRPCRetryMaxAttempts    int
 	GRPCRetryBaseDelay      time.Duration
 	GRPCRequestTimeout      time.Duration
+	GRPCTLSEnabled          bool
+	GRPCTLSCertFile         string
+	GRPCTLSKeyFile          string
+	GRPCTLSCAFile           string
+	RateLimitRPS            int
+	RateLimitBurst          int
+	MaxRequestBodyBytes     int64
 	OTelDisabled            bool
 	OTelServiceName         string
 	OTelExporterEndpoint    string
@@ -153,6 +160,19 @@ func Load() *Config {
 		grpcRequestTimeout = 5 * time.Second
 	}
 
+	rateLimitRPS, _ := strconv.Atoi(getEnv("RATE_LIMIT_RPS", "0"))
+	if rateLimitRPS < 0 {
+		rateLimitRPS = 0
+	}
+	rateLimitBurst, _ := strconv.Atoi(getEnv("RATE_LIMIT_BURST", "0"))
+	if rateLimitBurst <= 0 {
+		rateLimitBurst = rateLimitRPS
+	}
+	maxBodyBytes, _ := strconv.ParseInt(getEnv("MAX_REQUEST_BODY_BYTES", "1048576"), 10, 64)
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = 1 << 20
+	}
+
 	otelDisabled := getEnv("OTEL_DISABLED", "true") == "true"
 	otelServiceName := getEnv("OTEL_SERVICE_NAME", "")
 	if otelServiceName == "" {
@@ -192,6 +212,13 @@ func Load() *Config {
 		GRPCRetryMaxAttempts:    grpcRetryMaxAttempts,
 		GRPCRetryBaseDelay:      grpcRetryBaseDelay,
 		GRPCRequestTimeout:      grpcRequestTimeout,
+		GRPCTLSEnabled:          getEnv("GRPC_TLS_ENABLED", "false") == "true",
+		GRPCTLSCertFile:         getEnv("GRPC_TLS_CERT_FILE", ""),
+		GRPCTLSKeyFile:          getEnv("GRPC_TLS_KEY_FILE", ""),
+		GRPCTLSCAFile:           getEnv("GRPC_TLS_CA_FILE", ""),
+		RateLimitRPS:            rateLimitRPS,
+		RateLimitBurst:          rateLimitBurst,
+		MaxRequestBodyBytes:     maxBodyBytes,
 		OTelDisabled:            otelDisabled,
 		OTelServiceName:         otelServiceName,
 		OTelExporterEndpoint:    otelExporterEndpoint,

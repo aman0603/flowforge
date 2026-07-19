@@ -3,15 +3,15 @@ services:
     image: postgres:16-alpine
     container_name: flowforge-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: flowforge
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${POSTGRES_DB:-flowforge}"
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d flowforge"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-flowforge}"]
       interval: 3s
       timeout: 3s
       retries: 10
@@ -63,7 +63,7 @@ services:
     environment:
       PORT: "8080"
       GRPC_ADDR: "0.0.0.0:9090"
-      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       ENV: "development"
       SCHEMA_PATH: "schema.sql"
       REDIS_ADDR: "redis:6379"
@@ -92,7 +92,7 @@ services:
       - "9091:9090"
     environment:
       GRPC_ADDR: "0.0.0.0:9090"
-      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       METRICS_ADDR: "0.0.0.0:9091"
       OTEL_DISABLED: "false"
       OTEL_SERVICE_NAME: "flowforge-scheduler"
@@ -111,7 +111,7 @@ services:
       - "9092:9090"
     environment:
       GRPC_ADDR: "0.0.0.0:9090"
-      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       METRICS_ADDR: "0.0.0.0:9091"
       OTEL_DISABLED: "false"
       OTEL_SERVICE_NAME: "flowforge-recovery"
@@ -127,7 +127,7 @@ services:
       dockerfile: Dockerfile
     command: ["./worker"]
     environment:
-      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       WORKER_POLL_INTERVAL: "${WORKER_POLL_INTERVAL:-1s}"
       CLAIMED_STALE_TIMEOUT: "${CLAIMED_STALE_TIMEOUT:-30s}"
       RUNNING_STALE_TIMEOUT: "${RUNNING_STALE_TIMEOUT:-5m}"
@@ -169,7 +169,7 @@ services:
       dockerfile: Dockerfile
     command: ["./publisher"]
     environment:
-      DB_URL: "postgres://postgres:postgres@db:5432/flowforge?sslmode=disable"
+      DB_URL: "${DB_URL:-postgres://postgres:postgres@db:5432/flowforge?sslmode=disable}"
       KAFKA_BROKERS: "kafka:29092"
       KAFKA_TOPIC: "flowforge.workflow-events.v1"
       KAFKA_CLIENT_ID: "flowforge-publisher"
