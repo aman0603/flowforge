@@ -1567,3 +1567,196 @@ func (r *Repository) insertOutboxEventTx(
 
 	return nil
 }
+
+// ClaimPendingOutboxEvents selects up to batchSize pending/unclaimed outbox
+// events using FOR UPDATE SKIP LOCKED, then marks them claimed under the given
+// publisherID with a lease expiring at lockedUntil. Events whose previous claim
+// has expired are reclaimed. Events scheduled for a future available_at are
+// skipped. Each returned event carries the claim token (publisherID) required
+// to later mark it published.
+func (r *Repository) ClaimPendingOutboxEvents(
+	ctx context.Context,
+	publisherID string,
+	batchSize int,
+	claimTimeout time.Duration,
+	now time.Time,
+) ([]model.OutboxEvent, error) {
+	if batchSize <= 0 {
+		batchSize = 1
+	}
+	lockedUntil := now.Add(claimTimeout).UTC()
+
+	const claimQuery = `
+		UPDATE outbox_events o
+		SET locked_by = $1,
+		    locked_until = $2,
+		    attempts = o.attempts + 1
+		FROM (
+			SELECT id
+			FROM outbox_events
+			WHERE published_at IS NULL
+			  AND available_at <= $3
+			  AND (locked_until IS NULL OR locked_until <= $3)
+			ORDER BY created_at ASC
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		) sub
+		WHERE o.id = sub.id
+		RETURNING o.id, o.event_type, o.event_version, o.aggregate_type,
+		          o.aggregate_id, o.workflow_run_id, o.task_run_id, o.sequence,
+		          o.payload, o.created_at, o.available_at, o.attempts,
+		          o.last_error, o.locked_by, o.locked_until, o.published_at
+	`
+
+	rows, err := r.db.QueryContext(ctx, claimQuery, publisherID, lockedUntil, now.UTC(), batchSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to claim pending outbox events: %w", err)
+	}
+	defer rows.Close()
+
+	events, err := scanOutboxEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// MarkOutboxPublished marks a previously claimed event as published, but only
+// if it is still claimed by the given publisherID. This prevents a restarted
+// publisher from marking an event that was already reclaimed by another
+// publisher. A crash between Kafka acknowledgement and this call intentionally
+// produces a duplicate publication, which consumers must tolerate.
+func (r *Repository) MarkOutboxPublished(ctx context.Context, eventID, publisherID string, now time.Time) error {
+	const query = `
+		UPDATE outbox_events
+		SET published_at = $3,
+		    locked_by = NULL,
+		    locked_until = NULL
+		WHERE id = $1
+		  AND locked_by = $2
+		  AND published_at IS NULL
+	`
+	res, err := r.db.ExecContext(ctx, query, eventID, publisherID, now.UTC())
+	if err != nil {
+		return fmt.Errorf("failed to mark outbox event published: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read affected rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("outbox event %s was not claimed by %s or already published", eventID, publisherID)
+	}
+	return nil
+}
+
+// RecordOutboxError records a publication failure for a claimed event and
+// schedules its next attempt using exponential backoff capped at the given
+// maxRetries. Once maxRetries is exceeded the event is released (unlocked) with
+// an extended available_at so it is not retried in the immediate loop; the
+// retention/cleanup policy and operator alerts handle permanent failures.
+func (r *Repository) RecordOutboxError(
+	ctx context.Context,
+	eventID, publisherID, lastError string,
+	attempts int,
+	baseDelay time.Duration,
+	maxRetries int,
+	now time.Time,
+) error {
+	availableAt := now.UTC().Add(backoffDelay(attempts, baseDelay))
+	if attempts > maxRetries {
+		availableAt = now.UTC().Add(backoffDelay(maxRetries, baseDelay) * 10)
+	}
+	const query = `
+		UPDATE outbox_events
+		SET last_error = $3,
+		    available_at = $4,
+		    locked_by = NULL,
+		    locked_until = NULL
+		WHERE id = $1
+		  AND locked_by = $2
+	`
+	_, err := r.db.ExecContext(ctx, query, eventID, publisherID, lastError, availableAt)
+	if err != nil {
+		return fmt.Errorf("failed to record outbox error: %w", err)
+	}
+	return nil
+}
+
+// CleanupPublishedOutboxEvents removes published events older than the
+// retention window. Unpublished events are never removed.
+func (r *Repository) CleanupPublishedOutboxEvents(ctx context.Context, olderThan time.Time) (int64, error) {
+	const query = `
+		DELETE FROM outbox_events
+		WHERE published_at IS NOT NULL
+		  AND published_at < $1
+	`
+	res, err := r.db.ExecContext(ctx, query, olderThan.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup published outbox events: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to read affected rows: %w", err)
+	}
+	return affected, nil
+}
+
+// backoffDelay computes an exponential backoff duration for the given attempt
+// number (1-based). It doubles the base delay each attempt with a sensible cap.
+func backoffDelay(attempts int, base time.Duration) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	delay := base
+	for i := 1; i < attempts; i++ {
+		delay *= 2
+		if delay > 5*time.Minute {
+			delay = 5 * time.Minute
+			break
+		}
+	}
+	return delay
+}
+
+// scanOutboxEvents reads a result set of outbox_events rows into OutboxEvent values.
+func scanOutboxEvents(rows *sql.Rows) ([]model.OutboxEvent, error) {
+	var events []model.OutboxEvent
+	for rows.Next() {
+		var e model.OutboxEvent
+		var taskRunID, lockedBy, lastError sql.NullString
+		var lockedUntil, publishedAt sql.NullTime
+		if err := rows.Scan(
+			&e.ID, &e.EventType, &e.EventVersion, &e.AggregateType, &e.AggregateID,
+			&e.WorkflowRunID, &taskRunID, &e.Sequence, &e.Payload, &e.CreatedAt, &e.AvailableAt,
+			&e.Attempts, &lastError, &lockedBy, &lockedUntil, &publishedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan outbox event: %w", err)
+		}
+		if taskRunID.Valid {
+			v := taskRunID.String
+			e.TaskRunID = &v
+		}
+		if lockedBy.Valid {
+			v := lockedBy.String
+			e.LockedBy = &v
+		}
+		if lastError.Valid {
+			v := lastError.String
+			e.LastError = &v
+		}
+		if lockedUntil.Valid {
+			v := lockedUntil.Time
+			e.LockedUntil = &v
+		}
+		if publishedAt.Valid {
+			v := publishedAt.Time
+			e.PublishedAt = &v
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating outbox events: %w", err)
+	}
+	return events, nil
+}

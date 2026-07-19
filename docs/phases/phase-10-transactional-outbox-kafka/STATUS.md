@@ -1,6 +1,6 @@
 # Phase 10 Status
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-19 (Loop 4 complete)
 
 ## Current state
 
@@ -22,14 +22,15 @@ Last reviewed: 2026-07-19
 - [x] Loop 1: Add event contracts and outbox schema.
 - [x] Loop 2: Insert events atomically with repository transitions.
 - [x] Loop 3: Add Kafka configuration and Docker Compose infrastructure.
+- [x] Loop 4: Implement the outbox publisher.
 
 ## In progress
 
-- [ ] Loop 4: Implement the outbox publisher.
+- [ ] Loop 5: Deploy the publisher as a standalone service.
 
 ## Remaining
 
-- [ ] Loop 5: Deploy the publisher as a standalone service.
+- [ ] Loop 6: Add an idempotent consumer example.
 - [ ] Loop 5: Deploy the publisher as a standalone service.
 - [ ] Loop 6: Add an idempotent consumer example.
 - [ ] Loop 7: Add retention, observability, and documentation.
