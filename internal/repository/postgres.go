@@ -28,12 +28,63 @@ func (r *Repository) DB() *sql.DB {
 	return r.db
 }
 
-// New initializes a new Postgres Repository and connects to the database.
+// PoolConfig bounds the database connection pool. Zero values fall back to the
+// conservative defaults returned by DefaultPoolConfig so callers can tune only
+// what they care about.
+type PoolConfig struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+}
+
+// DefaultPoolConfig returns production-safe pool bounds. It prevents the
+// database/sql default of unlimited open connections, which can exhaust
+// PostgreSQL's max_connections under load across many horizontally scaled
+// service instances.
+func DefaultPoolConfig() PoolConfig {
+	return PoolConfig{
+		MaxOpenConns:    25,
+		MaxIdleConns:    10,
+		ConnMaxLifetime: 30 * time.Minute,
+		ConnMaxIdleTime: 5 * time.Minute,
+	}
+}
+
+// New initializes a new Postgres Repository with the default pool bounds.
 func New(dbURL string) (*Repository, error) {
+	return NewWithPool(dbURL, DefaultPoolConfig())
+}
+
+// NewWithPool initializes a new Postgres Repository and applies the supplied
+// connection pool bounds. Non-positive fields fall back to DefaultPoolConfig.
+func NewWithPool(dbURL string, pool PoolConfig) (*Repository, error) {
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
+
+	def := DefaultPoolConfig()
+	if pool.MaxOpenConns <= 0 {
+		pool.MaxOpenConns = def.MaxOpenConns
+	}
+	if pool.MaxIdleConns < 0 {
+		pool.MaxIdleConns = def.MaxIdleConns
+	}
+	if pool.MaxIdleConns > pool.MaxOpenConns {
+		pool.MaxIdleConns = pool.MaxOpenConns
+	}
+	if pool.ConnMaxLifetime <= 0 {
+		pool.ConnMaxLifetime = def.ConnMaxLifetime
+	}
+	if pool.ConnMaxIdleTime <= 0 {
+		pool.ConnMaxIdleTime = def.ConnMaxIdleTime
+	}
+
+	db.SetMaxOpenConns(pool.MaxOpenConns)
+	db.SetMaxIdleConns(pool.MaxIdleConns)
+	db.SetConnMaxLifetime(pool.ConnMaxLifetime)
+	db.SetConnMaxIdleTime(pool.ConnMaxIdleTime)
 
 	// Ping database to verify connection
 	if err := db.Ping(); err != nil {

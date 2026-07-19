@@ -40,7 +40,12 @@ func main() {
 	logger := tel.Logger()
 	logger.Info("initializing recovery service", zap.String("db", telemetry.RedactDBURL(cfg.DBURL)))
 
-	repo, err := repository.New(cfg.DBURL)
+	repo, err := repository.NewWithPool(cfg.DBURL, repository.PoolConfig{
+		MaxOpenConns:    cfg.DBMaxOpenConns,
+		MaxIdleConns:    cfg.DBMaxIdleConns,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+	})
 	if err != nil {
 		logger.Fatal("failed to connect to database", zap.Error(err))
 	}

@@ -42,7 +42,12 @@ func main() {
 	logger.Info("initializing api service", zap.String("db", telemetry.RedactDBURL(cfg.DBURL)))
 
 	// Initialize database repository
-	repo, err := repository.New(cfg.DBURL)
+	repo, err := repository.NewWithPool(cfg.DBURL, repository.PoolConfig{
+		MaxOpenConns:    cfg.DBMaxOpenConns,
+		MaxIdleConns:    cfg.DBMaxIdleConns,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+	})
 	if err != nil {
 		logger.Fatal("failed to initialize database", zap.Error(err))
 	}

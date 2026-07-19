@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,10 @@ type Config struct {
 	DBURL                   string
 	Env                     string
 	SchemaPath              string
+	DBMaxOpenConns          int
+	DBMaxIdleConns          int
+	DBConnMaxLifetime       time.Duration
+	DBConnMaxIdleTime       time.Duration
 	RedisAddr               string
 	RedisPassword           string
 	RedisDB                 int
@@ -112,6 +117,26 @@ func Load() *Config {
 		retention = 24 * time.Hour
 	}
 
+	dbMaxOpen, err := strconv.Atoi(getEnv("DB_MAX_OPEN_CONNS", "25"))
+	if err != nil || dbMaxOpen <= 0 {
+		dbMaxOpen = 25
+	}
+	dbMaxIdle, err := strconv.Atoi(getEnv("DB_MAX_IDLE_CONNS", "10"))
+	if err != nil || dbMaxIdle < 0 {
+		dbMaxIdle = 10
+	}
+	if dbMaxIdle > dbMaxOpen {
+		dbMaxIdle = dbMaxOpen
+	}
+	dbConnMaxLifetime, err := time.ParseDuration(getEnv("DB_CONN_MAX_LIFETIME", "30m"))
+	if err != nil {
+		dbConnMaxLifetime = 30 * time.Minute
+	}
+	dbConnMaxIdleTime, err := time.ParseDuration(getEnv("DB_CONN_MAX_IDLE_TIME", "5m"))
+	if err != nil {
+		dbConnMaxIdleTime = 5 * time.Minute
+	}
+
 	grpcRetryMaxAttempts := 3
 	if v, err := strconv.Atoi(getEnv("GRPC_RETRY_MAX_ATTEMPTS", "3")); err == nil && v >= 0 {
 		grpcRetryMaxAttempts = v
@@ -142,6 +167,10 @@ func Load() *Config {
 		DBURL:                   getEnv("DB_URL", "postgres://postgres:postgres@localhost:5432/flowforge?sslmode=disable"),
 		Env:                     getEnv("ENV", "development"),
 		SchemaPath:              getEnv("SCHEMA_PATH", "schema.sql"),
+		DBMaxOpenConns:          dbMaxOpen,
+		DBMaxIdleConns:          dbMaxIdle,
+		DBConnMaxLifetime:       dbConnMaxLifetime,
+		DBConnMaxIdleTime:       dbConnMaxIdleTime,
 		RedisAddr:               getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:           getEnv("REDIS_PASSWORD", ""),
 		RedisDB:                 redisDB,
@@ -173,6 +202,34 @@ func Load() *Config {
 		OutboxRetryBaseDelay:    retryBaseDelay,
 		OutboxRetention:         retention,
 	}
+}
+
+// Validate checks cross-field invariants and returns an error describing the
+// first problem found. It complements the fail-fast panics in Load and lets
+// callers (and tests) verify a Config without terminating the process.
+func (c *Config) Validate() error {
+	if c.WorkerHeartbeatInterval >= c.WorkerHeartbeatTTL {
+		return fmt.Errorf("worker heartbeat interval (%s) must be less than heartbeat TTL (%s)", c.WorkerHeartbeatInterval, c.WorkerHeartbeatTTL)
+	}
+	if c.TaskLeaseRenewInterval >= c.TaskLeaseTTL {
+		return fmt.Errorf("task lease renew interval (%s) must be less than lease TTL (%s)", c.TaskLeaseRenewInterval, c.TaskLeaseTTL)
+	}
+	if c.WorkerPoolSize <= 0 {
+		return fmt.Errorf("worker pool size must be greater than 0, got %d", c.WorkerPoolSize)
+	}
+	if c.WorkerQueueCapacity < c.WorkerPoolSize {
+		return fmt.Errorf("worker queue capacity (%d) must be >= worker pool size (%d)", c.WorkerQueueCapacity, c.WorkerPoolSize)
+	}
+	if c.WorkerClaimBatchSize <= 0 {
+		return fmt.Errorf("worker claim batch size must be greater than 0, got %d", c.WorkerClaimBatchSize)
+	}
+	if c.DBMaxOpenConns <= 0 {
+		return fmt.Errorf("db max open conns must be greater than 0, got %d", c.DBMaxOpenConns)
+	}
+	if c.DBMaxIdleConns > c.DBMaxOpenConns {
+		return fmt.Errorf("db max idle conns (%d) must be <= max open conns (%d)", c.DBMaxIdleConns, c.DBMaxOpenConns)
+	}
+	return nil
 }
 
 func getEnv(key, defaultValue string) string {

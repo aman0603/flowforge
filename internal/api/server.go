@@ -194,10 +194,13 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string, e
 func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf(":%s", s.cfg.Port)
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      httpmw.Middleware(s.router),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:              addr,
+		Handler:           httpmw.Middleware(s.router),
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB, mitigates slow-header / oversized-header DoS
 	}
 
 	log.Printf("Starting HTTP server on %s (env: %s)", addr, s.cfg.Env)
